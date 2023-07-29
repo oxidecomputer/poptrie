@@ -38,7 +38,7 @@
 //! 0.0.0.0.0/0     1.2.3.4
 //! ```
 //! We are going to build a poptrie based on 64-bit bitmaps. The way that
-//! poptrie works is by breaking up the IP address we need a nexthop for into
+//! poptrie works is by breaking up the IP address we need a nexthop for, into
 //! prefix chunks. The nodes of a poptrie contain bitmaps. Each one in the
 //! bitmap is a pointer to a child node. This means there up to 64 child nodes
 //! for any given poptrie node. Therefore if a prefix chunk needs to map onto
@@ -99,6 +99,7 @@
 //! pub struct Poptrie<T> {
 //!     pub interior: Vec<Interior>,
 //!     pub leaf: Vec<Leaf<T>>,
+//!     pub default: Option<Leaf<T>>,
 //! }
 //! ```
 //!
@@ -121,7 +122,7 @@
 //!
 //! ```
 //! pub struct Interior {
-//!     pub v: u64,
+//!     pub iv: u64,
 //!     pub interior_offset: u64,
 //!     pub leaf_offset: u64,
 //! }
@@ -195,7 +196,6 @@
 //! internal child nodes.
 //!
 //! ```text
-//!
 //!         1              5              4              1              3
 //!         6              0              8              7              2
 //!     +-------+      +-------+      +-------+      +-------+      +-------+
@@ -280,6 +280,7 @@
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// The poptrie data structure.
@@ -290,6 +291,9 @@ pub struct Poptrie<T> {
 
     /// An array of leaf nodes.
     pub leaf: Vec<Leaf<T>>,
+
+    /// A default route if any.
+    pub default: Option<Leaf<T>>,
 }
 
 /// An interior poptrie node.
@@ -372,80 +376,132 @@ impl<T: Default + Copy> From<Ipv4RoutingTable<T>> for Poptrie<T> {
 
 impl<T: Default + Copy> Poptrie<T> {
     pub fn construct4(&mut self, tree: Ipv4RoutingTable<T>) {
-        self.construct4_rec(tree, 0);
-    }
+        let mut forest = vec![(0, tree)];
 
-    fn construct4_rec(&mut self, tree: Ipv4RoutingTable<T>, depth: u8) {
-        let mut subforest = BTreeMap::<u8, Ipv4RoutingTable<T>>::new();
+        let mut ioff = 1;
+        for depth in 0..6 {
+            let mut subforest = Vec::<(u8, Ipv4RoutingTable<T>)>::new();
+            let mut children = 0;
+            let mut siblings = 0;
+            for (_, tree) in &forest {
+                let mut iv = 0u64;
+                let mut lv = 0u64;
 
-        let mut iv = 0u64;
-        let mut lv = 0u64;
-        // create internal nodes recursively
-        for (r, e) in &*tree {
-            // default route is special case
-            if r.1 == 0 {
-                continue;
-            }
-            let k = extract_32(6, depth, r.0);
-            let consumed = core::cmp::min((depth + 1) * 6, 32);
-            if r.1 <= consumed {
-                continue;
-            }
-            iv |= 1 << k;
-            match subforest.get_mut(&k) {
-                Some(ref mut table) => {
-                    table.insert(*r, *e);
-                }
-                None => {
-                    let mut tbl = Ipv4RoutingTable::<T>::default();
-                    tbl.insert(*r, *e);
-                    subforest.insert(k, tbl);
-                }
-            }
-        }
-        // create leaf nodes as we find them
-        for (r, e) in &*tree {
-            // default route is special case
-            if r.1 == 0 {
-                continue;
-            }
+                let mut subsubforest = Vec::<(u8, Ipv4RoutingTable<T>)>::new();
+                for (r, e) in &tree.0 {
+                    // default route case
+                    if r.1 == 0 {
+                        self.default = Some(Leaf { data: *e });
+                        continue;
+                    }
+                    let k = extract_32(6, depth, r.0);
+                    let consumed = core::cmp::min((depth + 1) * 6, 32);
+                    if r.1 <= consumed {
+                        if ((1 << k) & iv) == 0 {
+                            lv |= 1 << k;
+                            self.leaf.push(Leaf { data: *e });
+                        }
 
-            let k = extract_32(6, depth, r.0);
-            let consumed = core::cmp::min((depth + 1) * 6, 32);
-            if r.1 <= consumed {
-                // TODO insert leaf here
-                if ((1 << k) & iv) == 0 {
-                    lv |= 1 << k;
-                    self.leaf.push(Leaf { data: *e });
-                }
-
-                // If the prefix of the router entry is less than but not equal
-                // to the consumed number of bits, we need to add those bits to
-                // the bitvec.
-                if r.1 != consumed {
-                    // Shift by the extra bits and add to the bitvec for this
-                    // internal node.
-                    let extra = 1 << (consumed - r.1);
-                    for i in 1..(extra) {
-                        lv |= 1 << (k + i);
-                        self.leaf.push(Leaf { data: *e });
+                        // If the prefix of the router entry is less than but not equal
+                        // to the consumed number of bits, we need to add those bits to
+                        // the bitvec.
+                        if r.1 != consumed {
+                            // Shift by the extra bits and add to the bitvec for this
+                            // internal node.
+                            let extra = 1 << (consumed - r.1);
+                            for i in 1..(extra) {
+                                lv |= 1 << (k + i);
+                                self.leaf.push(Leaf { data: *e });
+                            }
+                        }
+                        continue;
+                    }
+                    iv |= 1 << k;
+                    match subsubforest.iter_mut().find(|x| x.0 == k) {
+                        Some(ref mut entry) => {
+                            entry.1.insert(*r, *e);
+                        }
+                        None => {
+                            let mut tbl = Ipv4RoutingTable::<T>::default();
+                            tbl.insert(*r, *e);
+                            subsubforest.push((k, tbl));
+                            if iv > 0 {
+                                children += 1;
+                            }
+                        }
                     }
                 }
+
+                if iv > 0 || lv > 0 {
+                    self.interior.push(Interior {
+                        iv,
+                        lv,
+                        interior_offset: if iv > 0 {
+                            ioff + siblings
+                        } else {
+                            0
+                        },
+                        leaf_offset: self.leaf.len() as u64,
+                    });
+                    if iv > 0 {
+                        siblings += 1;
+                    }
+                }
+                subforest.extend_from_slice(&subsubforest);
+            }
+            ioff += children;
+            forest = subforest;
+        }
+    }
+
+    pub fn match_v4(&self, addr: u32) -> Option<T> {
+        let mut i = 0u64;
+        let mut v = self.interior[i as usize].iv;
+        let mut offset = 0;
+        let mut n = extract_32(6, offset, addr);
+
+        #[cfg(test)]
+        println!("n={n}");
+
+        #[cfg(test)]
+        println!("{:#?}", self.interior[i as usize]);
+
+        let mut result = self.default.as_ref().map(|x| x.data);
+
+        while (v & (1 << n)) != 0 {
+            let base = self.interior[i as usize].interior_offset;
+            let arg = v & ((2 << n) - 1);
+            let bc = arg.count_ones() as u64;
+            i = base + bc - 1;
+            v = self.interior[i as usize].iv;
+
+            offset += 1;
+            n = extract_32(6, offset, addr);
+
+            #[cfg(test)]
+            println!("n={n}");
+
+            #[cfg(test)]
+            println!("{:#?}", self.interior[i as usize]);
+
+            // check for stash any potentially suboptimal matches, longer
+            // prefix matches will overwrite these
+            let base = self.interior[i as usize].leaf_offset;
+            let v = self.interior[i as usize].lv;
+            if (v & (1 << n)) != 0 {
+                let i = base - 1;
+                result = Some(self.leaf[i as usize].data)
             }
         }
-        if iv > 0 || lv > 0 {
-            self.interior.push(Interior {
-                iv,
-                lv,
-                interior_offset: self.interior.len() as u64,
-                leaf_offset: self.leaf.len() as u64,
-            });
+
+        let base = self.interior[i as usize].leaf_offset;
+        let v = self.interior[i as usize].lv;
+        if (v & (1 << n)) != 0 {
+            i = base - 1;
+            result = Some(self.leaf[i as usize].data)
         }
-        if depth < 5 {
-            for (_, subtree) in subforest.into_iter() {
-                self.construct4_rec(subtree, depth + 1);
-            }
-        }
+
+        result
     }
 }
 
@@ -464,7 +520,7 @@ extern crate std;
 mod test {
     use super::*;
 
-    #[derive(Default, Copy, Clone)]
+    #[derive(Default, Copy, Clone, PartialEq)]
     struct Ipv4(u32);
     impl core::fmt::Debug for Ipv4 {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -520,16 +576,8 @@ mod test {
     }
 
     #[test]
-    fn test_construct() {
-        let mut tbl = Ipv4RoutingTable::<Ipv4>::default();
-        tbl.add([1, 0, 0, 0], 8, Ipv4::new([1, 254, 254, 254]));
-        tbl.add([247, 33, 0, 0], 16, Ipv4::new([247, 33, 0, 1]));
-        tbl.add([247, 33, 12, 0], 24, Ipv4::new([247, 33, 12, 1]));
-        tbl.add([51, 12, 109, 0], 24, Ipv4::new([51, 12, 109, 10]));
-        tbl.add([77, 18, 0, 0], 16, Ipv4::new([77, 18, 10, 1]));
-        tbl.add([170, 1, 14, 3], 32, Ipv4::new([1, 7, 0, 1]));
-        tbl.add([0, 0, 0, 0], 0, Ipv4::new([1, 2, 3, 4]));
-
+    fn test_construct_rec() {
+        let tbl = test_routing_table_with_default_route();
         let pt = Poptrie::<Ipv4>::from(tbl);
 
         #[allow(clippy::identity_op)]
@@ -537,9 +585,69 @@ mod test {
             0u64 | 1 << 0 | 1 << 61 | 1 << 61 | 1 << 12 | 1 << 19 | 1 << 42;
 
         assert_eq!(expected_root_bitvec, pt.interior[0].iv);
-        assert_eq!(pt.leaf.len(), 26);
+        assert_eq!(pt.leaf.len(), 27);
 
         println!("{:#?}", pt);
+    }
+
+    #[test]
+    fn test_match() {
+        let tbl = test_routing_table();
+        let pt = Poptrie::<Ipv4>::from(tbl);
+
+        // Test hits
+        let addr = Ipv4::new([1, 7, 0, 1]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([1, 254, 254, 254])));
+
+        let addr = Ipv4::new([247, 33, 0, 1]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([247, 33, 0, 1])));
+
+        let addr = Ipv4::new([247, 33, 12, 0]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([247, 33, 12, 1])));
+
+        let addr = Ipv4::new([51, 12, 109, 0]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([51, 12, 109, 10])));
+
+        let addr = Ipv4::new([77, 18, 4, 7]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([77, 18, 10, 1])));
+
+        let addr = Ipv4::new([170, 1, 14, 3]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([1, 7, 0, 1])));
+
+        // Test default route
+        let addr = Ipv4::new([4, 7, 0, 1]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, None);
+
+        let tbl = test_routing_table_with_default_route();
+        let pt = Poptrie::<Ipv4>::from(tbl);
+
+        // Test default route
+        let addr = Ipv4::new([4, 7, 0, 1]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([1, 2, 3, 4])));
+    }
+
+    fn test_routing_table() -> Ipv4RoutingTable<Ipv4> {
+        let mut tbl = Ipv4RoutingTable::<Ipv4>::default();
+        tbl.add([1, 0, 0, 0], 8, Ipv4::new([1, 254, 254, 254]));
+        tbl.add([247, 33, 0, 0], 16, Ipv4::new([247, 33, 0, 1]));
+        tbl.add([247, 33, 12, 0], 24, Ipv4::new([247, 33, 12, 1]));
+        tbl.add([51, 12, 109, 0], 24, Ipv4::new([51, 12, 109, 10]));
+        tbl.add([77, 18, 0, 0], 16, Ipv4::new([77, 18, 10, 1]));
+        tbl.add([170, 1, 14, 3], 32, Ipv4::new([1, 7, 0, 1]));
+        tbl
+    }
+    fn test_routing_table_with_default_route() -> Ipv4RoutingTable<Ipv4> {
+        let mut tbl = test_routing_table();
+        tbl.add([0, 0, 0, 0], 0, Ipv4::new([1, 2, 3, 4]));
+        tbl
     }
 
     fn extract_32_all(v: u32) -> [u8; 6] {
