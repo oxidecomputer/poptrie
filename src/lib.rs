@@ -284,7 +284,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// The poptrie data structure.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Poptrie<T> {
     /// An array of interior nodes.
     pub interior: Vec<Interior>,
@@ -294,6 +294,18 @@ pub struct Poptrie<T> {
 
     /// A default route if any.
     pub default: Option<Leaf<T>>,
+}
+
+// NOTE #[derive(Default)] see:
+//     broken https://github.com/rust-lang/rust/issues/26925
+impl<T> Default for Poptrie<T> {
+    fn default() -> Self {
+        Self {
+            interior: Vec::new(),
+            leaf: Vec::new(),
+            default: None,
+        }
+    }
 }
 
 /// An interior poptrie node.
@@ -343,8 +355,16 @@ pub struct Leaf<T> {
     pub data: T,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Ipv4RoutingTable<T>(pub BTreeMap<(u32, u8), T>);
+
+// NOTE #[derive(Default)] see:
+//     broken https://github.com/rust-lang/rust/issues/26925
+impl<T> Default for Ipv4RoutingTable<T> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
 
 impl<T> core::ops::Deref for Ipv4RoutingTable<T> {
     type Target = BTreeMap<(u32, u8), T>;
@@ -366,7 +386,7 @@ impl<T> Ipv4RoutingTable<T> {
     }
 }
 
-impl<T: Default + Copy> From<Ipv4RoutingTable<T>> for Poptrie<T> {
+impl<T: Copy> From<Ipv4RoutingTable<T>> for Poptrie<T> {
     fn from(tree: Ipv4RoutingTable<T>) -> Self {
         let mut s = Self::default();
         s.construct4(tree);
@@ -374,32 +394,142 @@ impl<T: Default + Copy> From<Ipv4RoutingTable<T>> for Poptrie<T> {
     }
 }
 
-impl<T: Default + Copy> Poptrie<T> {
-    pub fn construct4(&mut self, tree: Ipv4RoutingTable<T>) {
-        let mut forest = vec![(0, tree)];
+#[derive(Clone)]
+pub struct Ipv6RoutingTable<T>(pub BTreeMap<(u128, u8), T>);
+
+// NOTE #[derive(Default)] see:
+//     broken https://github.com/rust-lang/rust/issues/26925
+impl<T> Default for Ipv6RoutingTable<T> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<T> core::ops::Deref for Ipv6RoutingTable<T> {
+    type Target = BTreeMap<(u128, u8), T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for Ipv6RoutingTable<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> Ipv6RoutingTable<T> {
+    pub fn add(&mut self, dst: [u8; 16], len: u8, nexthop: T) {
+        self.0.insert((u128::from_be_bytes(dst), len), nexthop);
+    }
+}
+
+impl<T: Copy> From<Ipv6RoutingTable<T>> for Poptrie<T> {
+    fn from(tree: Ipv6RoutingTable<T>) -> Self {
+        let mut s = Self::default();
+        s.construct6(tree);
+        s
+    }
+}
+
+macro_rules! extract {
+    ($width:expr, $offset:expr, $v:expr, $bits:expr) => {{
+        let shift = $bits.saturating_sub($width * ($offset + 1));
+        let mask = 0b111111 << shift;
+        let res = ($v & mask) >> shift;
+        res as u8
+    }};
+}
+
+pub fn extract_32(width: u8, offset: u8, v: u32) -> u8 {
+    extract!(width, offset, v, 32u8)
+}
+
+pub fn extract_128(width: u8, offset: u8, v: u32) -> u8 {
+    extract!(width, offset, v, 128u8)
+}
+
+//TODO having this as a macro is terrible for debugging as we get no backtrace
+macro_rules! matcher {
+    ($self:ident, $addr:tt, $bits:expr) => {{
+        let mut i = 0u64;
+        let mut v = $self.interior[i as usize].iv;
+        let mut offset = 0;
+        let mut n = extract!(6, offset, $addr, $bits);
+
+        #[cfg(test)]
+        println!("n={n}");
+
+        #[cfg(test)]
+        println!("{:#?}", $self.interior[i as usize]);
+
+        let mut result = $self.default.as_ref().map(|x| x.data);
+
+        while (v & (1 << n)) != 0 {
+            let base = $self.interior[i as usize].interior_offset;
+            let arg = v & ((2 << n) - 1);
+            let bc = arg.count_ones() as u64;
+            i = base + bc - 1;
+            v = $self.interior[i as usize].iv;
+
+            offset += 1;
+            n = extract!(6, offset, $addr, $bits);
+
+            #[cfg(test)]
+            println!("n={n}");
+
+            #[cfg(test)]
+            println!("{:#?}", $self.interior[i as usize]);
+
+            // check for stash any potentially suboptimal matches, longer
+            // prefix matches will overwrite these
+            let base = $self.interior[i as usize].leaf_offset;
+            let v = $self.interior[i as usize].lv;
+            if (v & (1 << n)) != 0 {
+                let i = base - 1;
+                result = Some($self.leaf[i as usize].data)
+            }
+        }
+
+        let base = $self.interior[i as usize].leaf_offset;
+        let v = $self.interior[i as usize].lv;
+        if (v & (1 << n)) != 0 {
+            i = base - 1;
+            result = Some($self.leaf[i as usize].data)
+        }
+
+        result
+    }};
+}
+
+//TODO having this as a macro is terrible for debugging as we get no backtrace
+macro_rules! construct {
+    ($self:ident, $tree:ident, $bits:expr, $depth:expr, $rt:ident<$t:tt>) => {{
+        let mut forest = vec![(0, $tree)];
 
         let mut ioff = 1;
-        for depth in 0..6 {
-            let mut subforest = Vec::<(u8, Ipv4RoutingTable<T>)>::new();
+        for depth in 0..$depth {
+            let mut subforest = Vec::<(u8, $rt<$t>)>::new();
             let mut children = 0;
             let mut siblings = 0;
-            for (_, tree) in &forest {
+            for (_, $tree) in &forest {
                 let mut iv = 0u64;
                 let mut lv = 0u64;
 
-                let mut subsubforest = Vec::<(u8, Ipv4RoutingTable<T>)>::new();
-                for (r, e) in &tree.0 {
+                let mut subsubforest = Vec::<(u8, $rt<$t>)>::new();
+                for (r, e) in &$tree.0 {
                     // default route case
                     if r.1 == 0 {
-                        self.default = Some(Leaf { data: *e });
+                        $self.default = Some(Leaf { data: *e });
                         continue;
                     }
-                    let k = extract_32(6, depth, r.0);
-                    let consumed = core::cmp::min((depth + 1) * 6, 32);
+                    let k = extract!(6, depth, r.0, $bits);
+                    let consumed = core::cmp::min((depth + 1) * 6, $bits);
                     if r.1 <= consumed {
                         if ((1 << k) & iv) == 0 {
                             lv |= 1 << k;
-                            self.leaf.push(Leaf { data: *e });
+                            $self.leaf.push(Leaf { data: *e });
                         }
 
                         // If the prefix of the router entry is less than but not equal
@@ -411,7 +541,7 @@ impl<T: Default + Copy> Poptrie<T> {
                             let extra = 1 << (consumed - r.1);
                             for i in 1..(extra) {
                                 lv |= 1 << (k + i);
-                                self.leaf.push(Leaf { data: *e });
+                                $self.leaf.push(Leaf { data: *e });
                             }
                         }
                         continue;
@@ -422,7 +552,7 @@ impl<T: Default + Copy> Poptrie<T> {
                             entry.1.insert(*r, *e);
                         }
                         None => {
-                            let mut tbl = Ipv4RoutingTable::<T>::default();
+                            let mut tbl = $rt::<$t>::default();
                             tbl.insert(*r, *e);
                             subsubforest.push((k, tbl));
                             if iv > 0 {
@@ -433,7 +563,7 @@ impl<T: Default + Copy> Poptrie<T> {
                 }
 
                 if iv > 0 || lv > 0 {
-                    self.interior.push(Interior {
+                    $self.interior.push(Interior {
                         iv,
                         lv,
                         interior_offset: if iv > 0 {
@@ -441,7 +571,7 @@ impl<T: Default + Copy> Poptrie<T> {
                         } else {
                             0
                         },
-                        leaf_offset: self.leaf.len() as u64,
+                        leaf_offset: $self.leaf.len() as u64,
                     });
                     if iv > 0 {
                         siblings += 1;
@@ -452,64 +582,25 @@ impl<T: Default + Copy> Poptrie<T> {
             ioff += children;
             forest = subforest;
         }
+    }}
+}
+
+impl<T: Copy> Poptrie<T> {
+    pub fn construct4(&mut self, tree: Ipv4RoutingTable<T>) {
+        construct!(self, tree, 32u8, 6, Ipv4RoutingTable<T>);
+    }
+
+    pub fn construct6(&mut self, tree: Ipv6RoutingTable<T>) {
+        construct!(self, tree, 128u8, 22, Ipv6RoutingTable<T>);
     }
 
     pub fn match_v4(&self, addr: u32) -> Option<T> {
-        let mut i = 0u64;
-        let mut v = self.interior[i as usize].iv;
-        let mut offset = 0;
-        let mut n = extract_32(6, offset, addr);
-
-        #[cfg(test)]
-        println!("n={n}");
-
-        #[cfg(test)]
-        println!("{:#?}", self.interior[i as usize]);
-
-        let mut result = self.default.as_ref().map(|x| x.data);
-
-        while (v & (1 << n)) != 0 {
-            let base = self.interior[i as usize].interior_offset;
-            let arg = v & ((2 << n) - 1);
-            let bc = arg.count_ones() as u64;
-            i = base + bc - 1;
-            v = self.interior[i as usize].iv;
-
-            offset += 1;
-            n = extract_32(6, offset, addr);
-
-            #[cfg(test)]
-            println!("n={n}");
-
-            #[cfg(test)]
-            println!("{:#?}", self.interior[i as usize]);
-
-            // check for stash any potentially suboptimal matches, longer
-            // prefix matches will overwrite these
-            let base = self.interior[i as usize].leaf_offset;
-            let v = self.interior[i as usize].lv;
-            if (v & (1 << n)) != 0 {
-                let i = base - 1;
-                result = Some(self.leaf[i as usize].data)
-            }
-        }
-
-        let base = self.interior[i as usize].leaf_offset;
-        let v = self.interior[i as usize].lv;
-        if (v & (1 << n)) != 0 {
-            i = base - 1;
-            result = Some(self.leaf[i as usize].data)
-        }
-
-        result
+        matcher!(self, addr, 32u8)
     }
-}
 
-pub fn extract_32(width: u8, offset: u8, v: u32) -> u8 {
-    let shift = 32u8.saturating_sub(width * (offset + 1));
-    let mask = 0b111111 << shift;
-    let res = (v & mask) >> shift;
-    res as u8
+    pub fn match_v6(&self, addr: u128) -> Option<T> {
+        matcher!(self, addr, 128u8)
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +623,36 @@ mod test {
     impl Ipv4 {
         fn new(v: [u8; 4]) -> Self {
             Self(u32::from_be_bytes(v))
+        }
+    }
+
+    #[derive(Default, Copy, Clone, PartialEq)]
+    struct Ipv6(u128);
+    impl core::fmt::Debug for Ipv6 {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let b = self.0.to_be_bytes();
+            write!(
+                f,
+                "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                b[0], b[1], b[2], b[3],
+                b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11],
+                b[12], b[13], b[14], b[15],
+            )
+        }
+    }
+
+    impl Ipv6 {
+        fn new(v: [u8; 16]) -> Self {
+            Self(u128::from_be_bytes(v))
+        }
+    }
+
+    impl std::str::FromStr for Ipv6 {
+        type Err = std::net::AddrParseError;
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            let addr: std::net::Ipv6Addr = s.parse()?;
+            Ok(Self::new(addr.octets()))
         }
     }
 
@@ -577,7 +698,7 @@ mod test {
 
     #[test]
     fn test_construct_rec() {
-        let tbl = test_routing_table_with_default_route();
+        let tbl = test_routing_table_with_default_route_v4();
         let pt = Poptrie::<Ipv4>::from(tbl);
 
         #[allow(clippy::identity_op)]
@@ -591,8 +712,8 @@ mod test {
     }
 
     #[test]
-    fn test_match() {
-        let tbl = test_routing_table();
+    fn test_match_v4() {
+        let tbl = test_routing_table_v4();
         let pt = Poptrie::<Ipv4>::from(tbl);
 
         // Test hits
@@ -604,11 +725,11 @@ mod test {
         let m = pt.match_v4(addr.0);
         assert_eq!(m, Some(Ipv4::new([247, 33, 0, 1])));
 
-        let addr = Ipv4::new([247, 33, 12, 0]);
+        let addr = Ipv4::new([247, 33, 12, 1]);
         let m = pt.match_v4(addr.0);
         assert_eq!(m, Some(Ipv4::new([247, 33, 12, 1])));
 
-        let addr = Ipv4::new([51, 12, 109, 0]);
+        let addr = Ipv4::new([51, 12, 109, 1]);
         let m = pt.match_v4(addr.0);
         assert_eq!(m, Some(Ipv4::new([51, 12, 109, 10])));
 
@@ -625,7 +746,7 @@ mod test {
         let m = pt.match_v4(addr.0);
         assert_eq!(m, None);
 
-        let tbl = test_routing_table_with_default_route();
+        let tbl = test_routing_table_with_default_route_v4();
         let pt = Poptrie::<Ipv4>::from(tbl);
 
         // Test default route
@@ -634,7 +755,57 @@ mod test {
         assert_eq!(m, Some(Ipv4::new([1, 2, 3, 4])));
     }
 
-    fn test_routing_table() -> Ipv4RoutingTable<Ipv4> {
+    #[test]
+    fn test_match_v6() {
+        let tbl = test_routing_table_v6();
+        let pt = Poptrie::<Ipv6>::from(tbl);
+
+        // Test hits
+        let addr: Ipv6 = "1:7:0::1".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "1::ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(m, Some(gw));
+
+        let addr: Ipv6 = "247:33::1".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "247:33::1".parse().unwrap();
+        assert_eq!(m, Some(gw));
+
+        let addr: Ipv6 = "247:33:12::1".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "247:33:12::1".parse().unwrap();
+        assert_eq!(m, Some(gw));
+
+        let addr: Ipv6 = "51:12:109::1".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "51:12:109::10".parse().unwrap();
+        assert_eq!(m, Some(gw));
+
+        let addr: Ipv6 = "77:18:4::7".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "77:18:10::1".parse().unwrap();
+        assert_eq!(m, Some(gw));
+
+        let addr: Ipv6 = "170:1:14::3".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "1:7:0::1".parse().unwrap();
+        assert_eq!(m, Some(gw));
+
+        // Test default route
+        let addr: Ipv6 = "4:7:0::1".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        assert_eq!(m, None);
+
+        let tbl = test_routing_table_with_default_route_v6();
+        let pt = Poptrie::<Ipv6>::from(tbl);
+
+        let addr: Ipv6 = "4:7:0::1".parse().unwrap();
+        let m = pt.match_v6(addr.0);
+        let gw: Ipv6 = "1:2:3::4".parse().unwrap();
+        assert_eq!(m, Some(gw));
+    }
+
+    fn test_routing_table_v4() -> Ipv4RoutingTable<Ipv4> {
         let mut tbl = Ipv4RoutingTable::<Ipv4>::default();
         tbl.add([1, 0, 0, 0], 8, Ipv4::new([1, 254, 254, 254]));
         tbl.add([247, 33, 0, 0], 16, Ipv4::new([247, 33, 0, 1]));
@@ -644,9 +815,50 @@ mod test {
         tbl.add([170, 1, 14, 3], 32, Ipv4::new([1, 7, 0, 1]));
         tbl
     }
-    fn test_routing_table_with_default_route() -> Ipv4RoutingTable<Ipv4> {
-        let mut tbl = test_routing_table();
+
+    fn test_routing_table_with_default_route_v4() -> Ipv4RoutingTable<Ipv4> {
+        let mut tbl = test_routing_table_v4();
         tbl.add([0, 0, 0, 0], 0, Ipv4::new([1, 2, 3, 4]));
+        tbl
+    }
+
+    fn test_routing_table_v6() -> Ipv6RoutingTable<Ipv6> {
+        let mut tbl = Ipv6RoutingTable::<Ipv6>::default();
+
+        let rt: std::net::Ipv6Addr = "1::".parse().unwrap();
+        let gw: Ipv6 = "1::ffff:ffff:ffff".parse().unwrap();
+        tbl.add(rt.octets(), 16, gw);
+
+        let rt: std::net::Ipv6Addr = "247:33::".parse().unwrap();
+        let gw: Ipv6 = "247:33::1".parse().unwrap();
+        tbl.add(rt.octets(), 32, gw);
+
+        let rt: std::net::Ipv6Addr = "247:33:12::".parse().unwrap();
+        let gw: Ipv6 = "247:33:12::1".parse().unwrap();
+        tbl.add(rt.octets(), 48, gw);
+
+        let rt: std::net::Ipv6Addr = "51:12:109::".parse().unwrap();
+        let gw: Ipv6 = "51:12:109::10".parse().unwrap();
+        tbl.add(rt.octets(), 48, gw);
+
+        let rt: std::net::Ipv6Addr = "77:18::".parse().unwrap();
+        let gw: Ipv6 = "77:18:10::1".parse().unwrap();
+        tbl.add(rt.octets(), 32, gw);
+
+        let rt: std::net::Ipv6Addr = "170:1:14::3".parse().unwrap();
+        let gw: Ipv6 = "1:7:0::1".parse().unwrap();
+        tbl.add(rt.octets(), 128, gw);
+
+        tbl
+    }
+
+    fn test_routing_table_with_default_route_v6() -> Ipv6RoutingTable<Ipv6> {
+        let mut tbl = test_routing_table_v6();
+
+        let rt: std::net::Ipv6Addr = "::".parse().unwrap();
+        let gw: Ipv6 = "1:2:3::4".parse().unwrap();
+        tbl.add(rt.octets(), 0, gw);
+
         tbl
     }
 
