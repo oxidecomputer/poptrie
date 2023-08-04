@@ -38,7 +38,7 @@
 //! 0.0.0.0.0/0     1.2.3.4
 //! ```
 //! We are going to build a poptrie based on 64-bit bitmaps. The way that
-//! poptrie works is by breaking up the IP address we need a nexthop for, into
+//! poptrie works is by breaking up the IP address we need a nexthop for into
 //! prefix chunks. The nodes of a poptrie contain bitmaps. Each one in the
 //! bitmap is a pointer to a child node. This means there up to 64 child nodes
 //! for any given poptrie node. Therefore if a prefix chunk needs to map onto

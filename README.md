@@ -12,3 +12,5 @@ Poptrie was created by Asai and Ohara in:
 
 This is a dependency free `no_std` implementation to facilitate use in OS
 kernels.
+
+**This is a work in progress implementation.**
