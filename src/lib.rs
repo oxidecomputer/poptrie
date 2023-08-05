@@ -454,24 +454,24 @@ pub fn extract_128(width: u8, offset: u8, v: u32) -> u8 {
 macro_rules! matcher {
     ($self:ident, $addr:tt, $bits:expr) => {{
         let mut i = 0u64;
-        let mut v = $self.interior[i as usize].iv;
+        let mut v = $self.interior.get(i as usize)?.iv;
         let mut offset = 0;
         let mut n = extract!(6, offset, $addr, $bits);
+
+        let mut result = None;
 
         #[cfg(test)]
         println!("n={n}");
 
         #[cfg(test)]
-        println!("{:#?}", $self.interior[i as usize]);
-
-        let mut result = $self.default.as_ref().map(|x| x.data);
+        println!("{:#?}", $self.interior.get(i as usize)?);
 
         while (v & (1 << n)) != 0 {
-            let base = $self.interior[i as usize].interior_offset;
+            let base = $self.interior.get(i as usize)?.interior_offset;
             let arg = v & ((2 << n) - 1);
             let bc = arg.count_ones() as u64;
             i = base + bc - 1;
-            v = $self.interior[i as usize].iv;
+            v = $self.interior.get(i as usize)?.iv;
 
             offset += 1;
             n = extract!(6, offset, $addr, $bits);
@@ -480,23 +480,23 @@ macro_rules! matcher {
             println!("n={n}");
 
             #[cfg(test)]
-            println!("{:#?}", $self.interior[i as usize]);
+            println!("{:#?}", $self.interior.get(i as usize)?);
 
             // check for stash any potentially suboptimal matches, longer
             // prefix matches will overwrite these
-            let base = $self.interior[i as usize].leaf_offset;
-            let v = $self.interior[i as usize].lv;
+            let base = $self.interior.get(i as usize)?.leaf_offset;
+            let v = $self.interior.get(i as usize)?.lv;
             if (v & (1 << n)) != 0 {
                 let i = base - 1;
-                result = Some($self.leaf[i as usize].data)
+                result = Some($self.leaf.get(i as usize)?.data)
             }
         }
 
-        let base = $self.interior[i as usize].leaf_offset;
-        let v = $self.interior[i as usize].lv;
+        let base = $self.interior.get(i as usize)?.leaf_offset;
+        let v = $self.interior.get(i as usize)?.lv;
         if (v & (1 << n)) != 0 {
             i = base - 1;
-            result = Some($self.leaf[i as usize].data)
+            result = Some($self.leaf.get(i as usize)?.data)
         }
 
         result
@@ -595,10 +595,20 @@ impl<T: Copy> Poptrie<T> {
     }
 
     pub fn match_v4(&self, addr: u32) -> Option<T> {
-        matcher!(self, addr, 32u8)
+        self.do_match_v4(addr)
+            .or(self.default.as_ref().map(|x| x.data))
     }
 
     pub fn match_v6(&self, addr: u128) -> Option<T> {
+        self.do_match_v6(addr)
+            .or(self.default.as_ref().map(|x| x.data))
+    }
+
+    pub fn do_match_v4(&self, addr: u32) -> Option<T> {
+        matcher!(self, addr, 32u8)
+    }
+
+    pub fn do_match_v6(&self, addr: u128) -> Option<T> {
         matcher!(self, addr, 128u8)
     }
 }
