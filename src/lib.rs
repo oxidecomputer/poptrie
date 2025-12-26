@@ -358,7 +358,7 @@ pub struct Leaf<T> {
 }
 
 #[derive(Clone)]
-pub struct Ipv4RoutingTable<T>(pub BTreeMap<(u32, u8), T>);
+pub struct Ipv4RoutingTable<T>(pub BTreeMap<([u8; 4], u8), T>);
 
 // NOTE #[derive(Default)] see:
 //     broken https://github.com/rust-lang/rust/issues/26925
@@ -369,7 +369,7 @@ impl<T> Default for Ipv4RoutingTable<T> {
 }
 
 impl<T> core::ops::Deref for Ipv4RoutingTable<T> {
-    type Target = BTreeMap<(u32, u8), T>;
+    type Target = BTreeMap<([u8; 4], u8), T>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -384,7 +384,7 @@ impl<T> core::ops::DerefMut for Ipv4RoutingTable<T> {
 
 impl<T> Ipv4RoutingTable<T> {
     pub fn add(&mut self, dst: [u8; 4], len: u8, nexthop: T) {
-        self.0.insert((u32::from_be_bytes(dst), len), nexthop);
+        self.0.insert((dst, len), nexthop);
     }
 }
 
@@ -397,7 +397,7 @@ impl<T: Clone> From<Ipv4RoutingTable<T>> for Poptrie<T> {
 }
 
 #[derive(Clone)]
-pub struct Ipv6RoutingTable<T>(pub BTreeMap<(u128, u8), T>);
+pub struct Ipv6RoutingTable<T>(pub BTreeMap<([u8; 16], u8), T>);
 
 // NOTE #[derive(Default)] see:
 //     broken https://github.com/rust-lang/rust/issues/26925
@@ -408,7 +408,7 @@ impl<T> Default for Ipv6RoutingTable<T> {
 }
 
 impl<T> core::ops::Deref for Ipv6RoutingTable<T> {
-    type Target = BTreeMap<(u128, u8), T>;
+    type Target = BTreeMap<([u8; 16], u8), T>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -423,7 +423,7 @@ impl<T> core::ops::DerefMut for Ipv6RoutingTable<T> {
 
 impl<T> Ipv6RoutingTable<T> {
     pub fn add(&mut self, dst: [u8; 16], len: u8, nexthop: T) {
-        self.0.insert((u128::from_be_bytes(dst), len), nexthop);
+        self.0.insert((dst, len), nexthop);
     }
 }
 
@@ -507,7 +507,7 @@ macro_rules! matcher {
 
 //TODO having this as a macro is terrible for debugging as we get no backtrace
 macro_rules! construct {
-    ($self:ident, $tree:ident, $bits:expr, $depth:expr, $rt:ident<$t:tt>) => {{
+    ($self:ident, $tree:ident, $bits:expr, $depth:expr, $rt:ident<$t:tt>, $w:tt) => {{
         let mut forest = vec![(0, $tree)];
 
         let mut ioff = 1;
@@ -526,7 +526,7 @@ macro_rules! construct {
                         $self.default = Some(Leaf { data: e.clone() });
                         continue;
                     }
-                    let k = extract!(6, depth, r.0, $bits);
+                    let k = extract!(6, depth, $w::from_be_bytes(r.0), $bits);
                     let consumed = core::cmp::min((depth + 1) * 6, $bits);
                     if r.1 <= consumed {
                         if ((1 << k) & iv) == 0 {
@@ -589,11 +589,11 @@ macro_rules! construct {
 
 impl<T: Clone> Poptrie<T> {
     pub fn construct4(&mut self, tree: Ipv4RoutingTable<T>) {
-        construct!(self, tree, 32u8, 6, Ipv4RoutingTable<T>);
+        construct!(self, tree, 32u8, 6, Ipv4RoutingTable<T>, u32);
     }
 
     pub fn construct6(&mut self, tree: Ipv6RoutingTable<T>) {
-        construct!(self, tree, 128u8, 22, Ipv6RoutingTable<T>);
+        construct!(self, tree, 128u8, 22, Ipv6RoutingTable<T>, u128);
     }
 
     pub fn match_v4(&self, addr: u32) -> Option<T> {
