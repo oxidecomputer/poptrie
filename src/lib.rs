@@ -489,7 +489,9 @@ macro_rules! matcher {
             let base = $self.interior.get(i as usize)?.leaf_offset;
             let v = $self.interior.get(i as usize)?.lv;
             if (v & (1 << n)) != 0 {
-                let i = base - 1;
+                let arg = v & ((2 << n) - 1);
+                let bc = arg.count_ones() as u64;
+                let i = base - v.count_ones() as u64 + bc - 1;
                 result = Some($self.leaf.get(i as usize)?.data.clone())
             }
         }
@@ -497,7 +499,9 @@ macro_rules! matcher {
         let base = $self.interior.get(i as usize)?.leaf_offset;
         let v = $self.interior.get(i as usize)?.lv;
         if (v & (1 << n)) != 0 {
-            i = base - 1;
+            let arg = v & ((2 << n) - 1);
+            let bc = arg.count_ones() as u64;
+            i = base - v.count_ones() as u64 + bc - 1;
             result = Some($self.leaf.get(i as usize)?.data.clone())
         }
 
@@ -513,8 +517,9 @@ macro_rules! construct {
         let mut ioff = 1;
         for depth in 0..$depth {
             let mut subforest = Vec::<(u8, $rt<$t>)>::new();
-            let mut children = 0;
-            let mut siblings = 0;
+            // Tracks cumulative count of children from preceding sibling trees.
+            // This is used to compute interior_offset for each tree's children.
+            let mut child_offset = 0;
             for (_, $tree) in &forest {
                 let mut iv = 0u64;
                 let mut lv = 0u64;
@@ -557,9 +562,6 @@ macro_rules! construct {
                             let mut tbl = $rt::<$t>::default();
                             tbl.insert(*r, e.clone());
                             subsubforest.push((k, tbl));
-                            if iv > 0 {
-                                children += 1;
-                            }
                         }
                     }
                 }
@@ -569,19 +571,18 @@ macro_rules! construct {
                         iv,
                         lv,
                         interior_offset: if iv > 0 {
-                            ioff + siblings
+                            ioff + child_offset
                         } else {
                             0
                         },
                         leaf_offset: $self.leaf.len() as u64,
                     });
-                    if iv > 0 {
-                        siblings += 1;
-                    }
                 }
+                // Add this tree's children count to the offset for subsequent trees
+                child_offset += subsubforest.len() as u64;
                 subforest.extend_from_slice(&subsubforest);
             }
-            ioff += children;
+            ioff += subforest.len() as u64;
             forest = subforest;
         }
     }}
