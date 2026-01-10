@@ -768,6 +768,32 @@ mod test {
     }
 
     #[test]
+    fn test_match_v4_sus() {
+        let tbl = test_routing_table_sus_v4();
+        let pt = Poptrie::<Ipv4>::from(tbl);
+
+        let addr = Ipv4::new([169, 254, 254, 1]);
+        let m = pt.match_v4(addr.0);
+        assert_eq!(m, Some(Ipv4::new([1, 1, 1, 7])));
+    }
+
+    fn test_routing_table_sus_v4() -> Ipv4RoutingTable<Ipv4> {
+        let mut tbl = Ipv4RoutingTable::<Ipv4>::default();
+
+        tbl.add([169, 254, 0, 0], 31, Ipv4::new([1, 1, 1, 1]));
+        tbl.add([169, 254, 0, 2], 31, Ipv4::new([1, 1, 1, 2]));
+        tbl.add([169, 254, 0, 6], 31, Ipv4::new([1, 1, 1, 3]));
+        tbl.add([169, 254, 0, 32], 31, Ipv4::new([1, 1, 1, 4]));
+        tbl.add([169, 254, 0, 34], 31, Ipv4::new([1, 1, 1, 5]));
+        tbl.add([169, 254, 0, 38], 31, Ipv4::new([1, 1, 1, 6]));
+        tbl.add([169, 254, 254, 1], 32, Ipv4::new([1, 1, 1, 7]));
+        tbl.add([169, 254, 254, 2], 32, Ipv4::new([1, 1, 1, 8]));
+        tbl.add([169, 254, 254, 4], 32, Ipv4::new([1, 1, 1, 9]));
+        tbl.add([172, 20, 29, 0], 24, Ipv4::new([1, 1, 1, 10]));
+        tbl
+    }
+
+    #[test]
     fn test_match_v4_multi() {
         let tbl = test_routing_table_v4_mp();
         let pt = Poptrie::<Vec<Ipv4>>::from(tbl);
