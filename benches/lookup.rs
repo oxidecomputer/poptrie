@@ -83,10 +83,7 @@ fn bench_single_lookup(c: &mut Criterion) {
             &size,
             |b, _| {
                 b.iter(|| {
-                    black_box(longest_match_v4(
-                        &table,
-                        black_box(addr_bytes),
-                    ))
+                    black_box(longest_match_v4(&table, black_box(addr_bytes)))
                 })
             },
         );

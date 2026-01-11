@@ -35,12 +35,20 @@ pub fn mask_v6(addr: [u8; 16], prefix_len: u8) -> [u8; 16] {
 }
 
 /// Check if addr is within the prefix defined by (prefix_addr, prefix_len).
-pub fn addr_in_prefix_v4(addr: [u8; 4], prefix_addr: [u8; 4], prefix_len: u8) -> bool {
+pub fn addr_in_prefix_v4(
+    addr: [u8; 4],
+    prefix_addr: [u8; 4],
+    prefix_len: u8,
+) -> bool {
     mask_v4(addr, prefix_len) == mask_v4(prefix_addr, prefix_len)
 }
 
 /// Check if addr is within the prefix defined by (prefix_addr, prefix_len).
-pub fn addr_in_prefix_v6(addr: [u8; 16], prefix_addr: [u8; 16], prefix_len: u8) -> bool {
+pub fn addr_in_prefix_v6(
+    addr: [u8; 16],
+    prefix_addr: [u8; 16],
+    prefix_len: u8,
+) -> bool {
     mask_v6(addr, prefix_len) == mask_v6(prefix_addr, prefix_len)
 }
 
@@ -48,7 +56,10 @@ pub fn addr_in_prefix_v6(addr: [u8; 16], prefix_addr: [u8; 16], prefix_len: u8) 
 ///
 /// This is a naive O(n) implementation used for verification against
 /// the optimized poptrie implementation.
-pub fn longest_match_v4<T: Clone>(table: &Ipv4RoutingTable<T>, addr: [u8; 4]) -> Option<T> {
+pub fn longest_match_v4<T: Clone>(
+    table: &Ipv4RoutingTable<T>,
+    addr: [u8; 4],
+) -> Option<T> {
     let mut best_match: Option<(u8, T)> = None;
     for ((prefix_addr, prefix_len), nexthop) in table.iter() {
         if addr_in_prefix_v4(addr, *prefix_addr, *prefix_len) {
@@ -68,7 +79,10 @@ pub fn longest_match_v4<T: Clone>(table: &Ipv4RoutingTable<T>, addr: [u8; 4]) ->
 ///
 /// This is a naive O(n) implementation used for verification against
 /// the optimized poptrie implementation.
-pub fn longest_match_v6<T: Clone>(table: &Ipv6RoutingTable<T>, addr: [u8; 16]) -> Option<T> {
+pub fn longest_match_v6<T: Clone>(
+    table: &Ipv6RoutingTable<T>,
+    addr: [u8; 16],
+) -> Option<T> {
     let mut best_match: Option<(u8, T)> = None;
     for ((prefix_addr, prefix_len), nexthop) in table.iter() {
         if addr_in_prefix_v6(addr, *prefix_addr, *prefix_len) {
@@ -132,30 +146,37 @@ pub mod strategies {
     }
 
     /// Strategy for generating a valid IPv6 route (address masked to prefix length).
-    pub fn ipv6_route_strategy() -> impl Strategy<Value = ([u8; 16], u8, u128)> {
+    pub fn ipv6_route_strategy() -> impl Strategy<Value = ([u8; 16], u8, u128)>
+    {
         (any::<[u8; 16]>(), 0u8..=128, any::<u128>())
             .prop_map(|(addr, len, nexthop)| (mask_v6(addr, len), len, nexthop))
     }
 
     /// Strategy for generating an IPv4 routing table with 1 to 8192 routes.
-    pub fn ipv4_table_strategy() -> impl Strategy<Value = Ipv4RoutingTable<u32>> {
-        prop::collection::vec(ipv4_route_strategy(), 1..8192).prop_map(|routes| {
-            let mut table = Ipv4RoutingTable::default();
-            for (addr, len, nexthop) in routes {
-                table.add(addr, len, nexthop);
-            }
-            table
-        })
+    pub fn ipv4_table_strategy() -> impl Strategy<Value = Ipv4RoutingTable<u32>>
+    {
+        prop::collection::vec(ipv4_route_strategy(), 1..8192).prop_map(
+            |routes| {
+                let mut table = Ipv4RoutingTable::default();
+                for (addr, len, nexthop) in routes {
+                    table.add(addr, len, nexthop);
+                }
+                table
+            },
+        )
     }
 
     /// Strategy for generating an IPv6 routing table with 1 to 8192 routes.
-    pub fn ipv6_table_strategy() -> impl Strategy<Value = Ipv6RoutingTable<u128>> {
-        prop::collection::vec(ipv6_route_strategy(), 1..8192).prop_map(|routes| {
-            let mut table = Ipv6RoutingTable::default();
-            for (addr, len, nexthop) in routes {
-                table.add(addr, len, nexthop);
-            }
-            table
-        })
+    pub fn ipv6_table_strategy() -> impl Strategy<Value = Ipv6RoutingTable<u128>>
+    {
+        prop::collection::vec(ipv6_route_strategy(), 1..8192).prop_map(
+            |routes| {
+                let mut table = Ipv6RoutingTable::default();
+                for (addr, len, nexthop) in routes {
+                    table.add(addr, len, nexthop);
+                }
+                table
+            },
+        )
     }
 }
