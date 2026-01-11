@@ -329,13 +329,13 @@ impl core::fmt::Debug for Interior {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut islots = Vec::new();
         let mut lslots = Vec::new();
-        for i in 0..63 {
-            if (self.iv & (1 << i)) != 0 {
+        for i in 0..64 {
+            if (self.iv & (1u64 << i)) != 0 {
                 islots.push(i);
             }
         }
-        for i in 0..63 {
-            if (self.lv & (1 << i)) != 0 {
+        for i in 0..64 {
+            if (self.lv & (1u64 << i)) != 0 {
                 lslots.push(i);
             }
         }
@@ -452,6 +452,17 @@ pub fn extract_128(width: u8, offset: u8, v: u32) -> u8 {
     extract!(width, offset, v, 128u8)
 }
 
+/// Create a mask with bits 0 through n (inclusive) set.
+/// For n=63, returns u64::MAX (all bits set).
+#[inline]
+fn mask_through(n: u8) -> u64 {
+    if n >= 63 {
+        u64::MAX
+    } else {
+        (1u64 << (n + 1)) - 1
+    }
+}
+
 //TODO having this as a macro is terrible for debugging as we get no backtrace
 macro_rules! matcher {
     ($self:ident, $addr:tt, $bits:expr) => {{
@@ -468,9 +479,24 @@ macro_rules! matcher {
         #[cfg(test)]
         println!("{:#?}", $self.interior.get(i as usize)?);
 
-        while (v & (1 << n)) != 0 {
+        while (v & (1u64 << n)) != 0 {
+            // Check for stash at CURRENT node BEFORE descending.
+            // This handles the case where both an interior child AND a leaf
+            // exist at the same position (shorter prefix provides fallback).
+            {
+                let lv = $self.interior.get(i as usize)?.lv;
+                if (lv & (1u64 << n)) != 0 {
+                    let base = $self.interior.get(i as usize)?.leaf_offset;
+                    let arg = lv & mask_through(n);
+                    let bc = arg.count_ones() as u64;
+                    let leaf_i = base - lv.count_ones() as u64 + bc - 1;
+                    result = Some($self.leaf.get(leaf_i as usize)?.data.clone())
+                }
+            }
+
+            // Now descend to the interior child
             let base = $self.interior.get(i as usize)?.interior_offset;
-            let arg = v & ((2 << n) - 1);
+            let arg = v & mask_through(n);
             let bc = arg.count_ones() as u64;
             i = base + bc - 1;
             v = $self.interior.get(i as usize)?.iv;
@@ -483,23 +509,13 @@ macro_rules! matcher {
 
             #[cfg(test)]
             println!("{:#?}", $self.interior.get(i as usize)?);
-
-            // check for stash any potentially suboptimal matches, longer
-            // prefix matches will overwrite these
-            let base = $self.interior.get(i as usize)?.leaf_offset;
-            let v = $self.interior.get(i as usize)?.lv;
-            if (v & (1 << n)) != 0 {
-                let arg = v & ((2 << n) - 1);
-                let bc = arg.count_ones() as u64;
-                let i = base - v.count_ones() as u64 + bc - 1;
-                result = Some($self.leaf.get(i as usize)?.data.clone())
-            }
         }
 
+        // Final leaf lookup at the terminal node
         let base = $self.interior.get(i as usize)?.leaf_offset;
         let v = $self.interior.get(i as usize)?.lv;
-        if (v & (1 << n)) != 0 {
-            let arg = v & ((2 << n) - 1);
+        if (v & (1u64 << n)) != 0 {
+            let arg = v & mask_through(n);
             let bc = arg.count_ones() as u64;
             i = base - v.count_ones() as u64 + bc - 1;
             result = Some($self.leaf.get(i as usize)?.data.clone())
@@ -525,7 +541,18 @@ macro_rules! construct {
                 let mut lv = 0u64;
 
                 let mut subsubforest = Vec::<(u8, $rt<$t>)>::new();
-                for (r, e) in &$tree.0 {
+                // Collect leaves with their bit positions for later sorting.
+                // Leaves must be pushed in bit-position order for the matcher's
+                // popcount-based indexing to work correctly.
+                let mut pending_leaves: Vec<(u8, $t)> = Vec::new();
+
+                // Sort routes by descending prefix length (more specific first).
+                // This ensures longer prefixes claim their slots before shorter
+                // prefixes, implementing proper longest-prefix-match semantics.
+                let mut routes: Vec<_> = $tree.0.iter().collect();
+                routes.sort_by(|a, b| b.0.1.cmp(&a.0.1));
+
+                for (r, e) in routes {
                     // default route case
                     if r.1 == 0 {
                         $self.default = Some(Leaf { data: e.clone() });
@@ -534,9 +561,14 @@ macro_rules! construct {
                     let k = extract!(6, depth, $w::from_be_bytes(r.0), $bits);
                     let consumed = core::cmp::min((depth + 1) * 6, $bits);
                     if r.1 <= consumed {
-                        if ((1 << k) & iv) == 0 {
-                            lv |= 1 << k;
-                            $self.leaf.push(Leaf { data: e.clone() });
+                        // Only add leaf if no existing leaf at this position.
+                        // More specific prefixes (processed first) take precedence.
+                        // Note: We allow setting lv even when iv is set - this provides
+                        // fallback matches when traversing through interior nodes
+                        // doesn't find a more specific match (the "stash" logic).
+                        if ((1u64 << k) & lv) == 0 {
+                            lv |= 1u64 << k;
+                            pending_leaves.push((k, e.clone()));
                         }
 
                         // If the prefix of the router entry is less than but not equal
@@ -545,15 +577,18 @@ macro_rules! construct {
                         if r.1 != consumed {
                             // Shift by the extra bits and add to the bitvec for this
                             // internal node.
-                            let extra = 1 << (consumed - r.1);
+                            let extra = 1u64 << (consumed - r.1);
                             for i in 1..(extra) {
-                                lv |= 1 << (k + i);
-                                $self.leaf.push(Leaf { data: e.clone() });
+                                // Only add if slot not already claimed by more specific prefix
+                                if ((1u64 << (k + i as u8)) & lv) == 0 {
+                                    lv |= 1u64 << (k + i as u8);
+                                    pending_leaves.push((k + i as u8, e.clone()));
+                                }
                             }
                         }
                         continue;
                     }
-                    iv |= 1 << k;
+                    iv |= 1u64 << k;
                     match subsubforest.iter_mut().find(|x| x.0 == k) {
                         Some(ref mut entry) => {
                             entry.1.insert(*r, e.clone());
@@ -564,6 +599,14 @@ macro_rules! construct {
                             subsubforest.push((k, tbl));
                         }
                     }
+                }
+
+                // Sort leaves by bit position and push them in order.
+                // The matcher uses popcount to index into leaves, which requires
+                // leaves to be stored in bit-position order.
+                pending_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, data) in pending_leaves {
+                    $self.leaf.push(Leaf { data });
                 }
 
                 if iv > 0 || lv > 0 {
@@ -578,6 +621,11 @@ macro_rules! construct {
                         leaf_offset: $self.leaf.len() as u64,
                     });
                 }
+                // Sort children by k value to maintain correct popcount-based indexing.
+                // The matcher uses popcount to find the child index, which assumes
+                // children are stored in order of their bit positions in iv.
+                subsubforest.sort_by(|a, b| a.0.cmp(&b.0));
+
                 // Add this tree's children count to the offset for subsequent trees
                 child_offset += subsubforest.len() as u64;
                 subforest.extend_from_slice(&subsubforest);
@@ -1069,5 +1117,165 @@ mod test {
             extract_32(6, 4, v),
             extract_32(6, 5, v),
         ]
+    }
+
+    // Test case for underflow bug found by proptest
+    // Minimal failing input: routes [0.0.0.128/25, 0.0.0.0/8]
+    // (The proptest output showed [0.0.0.252/25] but that gets masked to [0.0.0.128/25])
+    #[test]
+    fn test_underflow_bug() {
+        let mut tbl = Ipv4RoutingTable::<u32>::default();
+        // Use properly masked addresses (host bits must be zero)
+        tbl.add([0, 0, 0, 128], 25, 1); // 0.0.0.128/25
+        tbl.add([0, 0, 0, 0], 8, 2); // 0.0.0.0/8
+
+        let pt = Poptrie::from(tbl);
+
+        // Debug output
+        println!("interior nodes: {}", pt.interior.len());
+        println!("leaf nodes: {}", pt.leaf.len());
+        for (i, interior) in pt.interior.iter().enumerate() {
+            println!(
+                "  interior[{}]: ioff={}, loff={}",
+                i, interior.interior_offset, interior.leaf_offset
+            );
+            println!("{:#?}", interior);
+        }
+
+        // Looking up 0.0.0.0 should match the /8 route
+        let addr = u32::from_be_bytes([0, 0, 0, 0]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(2));
+
+        // Looking up 0.0.0.128 should match the /25 route
+        let addr = u32::from_be_bytes([0, 0, 0, 128]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(1));
+    }
+
+    // Test case for LPM bug found by proptest
+    // Minimal failing input: /1 and /2 prefixes at same address
+    // The more specific /2 should win over /1
+    #[test]
+    fn test_lpm_overlapping_prefixes() {
+        let mut tbl = Ipv4RoutingTable::<u32>::default();
+        tbl.add([0, 0, 0, 0], 1, 1); // /1 -> nexthop 1
+        tbl.add([0, 0, 0, 0], 2, 0); // /2 -> nexthop 0 (more specific)
+
+        let pt = Poptrie::from(tbl);
+
+        // Debug output
+        println!("interior nodes: {}", pt.interior.len());
+        println!("leaf nodes: {}", pt.leaf.len());
+        for (i, interior) in pt.interior.iter().enumerate() {
+            println!(
+                "  interior[{}]: ioff={}, loff={}",
+                i, interior.interior_offset, interior.leaf_offset
+            );
+            println!("{:#?}", interior);
+        }
+        for (i, leaf) in pt.leaf.iter().enumerate() {
+            println!("  leaf[{}]: {}", i, leaf.data);
+        }
+
+        // Looking up 0.0.0.0 should match the /2 route (more specific)
+        let addr = u32::from_be_bytes([0, 0, 0, 0]);
+        let result = pt.match_v4(addr);
+        assert_eq!(
+            result,
+            Some(0),
+            "Should match /2 (nexthop 0), not /1 (nexthop 1)"
+        );
+    }
+
+    // Test case from proptest: short prefix (/1) should match addresses
+    // in its range even when there's a more specific route elsewhere.
+    #[test]
+    fn test_short_prefix_bug() {
+        let mut tbl = Ipv4RoutingTable::<u32>::default();
+        tbl.add([128, 0, 0, 0], 1, 1); // /1 -> nexthop 1 (covers 128.0.0.0 - 255.255.255.255)
+        tbl.add([228, 0, 0, 0], 7, 2); // /7 -> nexthop 2
+
+        let pt = Poptrie::from(tbl.clone());
+
+        // Debug output
+        println!("interior nodes: {}", pt.interior.len());
+        println!("leaf nodes: {}", pt.leaf.len());
+        for (i, interior) in pt.interior.iter().enumerate() {
+            println!(
+                "  interior[{}]: iv={:#018x}, lv={:#018x}, ioff={}, loff={}",
+                i,
+                interior.iv,
+                interior.lv,
+                interior.interior_offset,
+                interior.leaf_offset
+            );
+        }
+        for (i, leaf) in pt.leaf.iter().enumerate() {
+            println!("  leaf[{}]: {}", i, leaf.data);
+        }
+
+        // Looking up 230.0.0.0 should match the /1 route
+        // 230 = 0xE6, first 6 bits = 57
+        let addr = u32::from_be_bytes([230, 0, 0, 0]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(1), "Should match /1 (nexthop 1)");
+
+        // Looking up 228.0.0.0 should match the /7 route
+        let addr = u32::from_be_bytes([228, 0, 0, 0]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(2), "Should match /7 (nexthop 2)");
+
+        // Looking up 128.0.0.0 should match the /1 route
+        let addr = u32::from_be_bytes([128, 0, 0, 0]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(1), "Should match /1 (nexthop 1)");
+    }
+
+    // Test case from proptest minimal failing input:
+    // prefix_16 = [0, 0], third_bytes = {0}, fourth_bytes = [62]
+    // Routes: [0,0,0,0]/24, [0,0,0,62]/31, [0,0,0,62]/32
+    #[test]
+    fn test_dense_route_bug() {
+        let mut tbl = Ipv4RoutingTable::<u32>::default();
+        // Add routes with varying prefix lengths at same location
+        // Note: /24 masks to [0,0,0,0], /31 and /32 stay as [0,0,0,62]
+        tbl.add([0, 0, 0, 0], 24, 0); // nexthop 0 for /24
+        tbl.add([0, 0, 0, 62], 31, 1); // nexthop 1 for /31
+        tbl.add([0, 0, 0, 62], 32, 2); // nexthop 2 for /32
+
+        let pt = Poptrie::from(tbl);
+
+        // Debug output
+        println!("interior nodes: {}", pt.interior.len());
+        println!("leaf nodes: {}", pt.leaf.len());
+        for (i, interior) in pt.interior.iter().enumerate() {
+            println!(
+                "  interior[{}]: iv={:#018x}, lv={:#018x}, ioff={}, loff={}",
+                i,
+                interior.iv,
+                interior.lv,
+                interior.interior_offset,
+                interior.leaf_offset
+            );
+        }
+        for (i, leaf) in pt.leaf.iter().enumerate() {
+            println!("  leaf[{}]: {}", i, leaf.data);
+        }
+
+        // Looking up 0.0.0.62 should match the /32 route (most specific)
+        let addr = u32::from_be_bytes([0, 0, 0, 62]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(2), "Should match /32 (nexthop 2)");
+
+        // Looking up 0.0.0.63 should match the /31 route
+        let addr = u32::from_be_bytes([0, 0, 0, 63]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(1), "Should match /31 (nexthop 1)");
+
+        // Looking up 0.0.0.0 should match the /24 route
+        let addr = u32::from_be_bytes([0, 0, 0, 0]);
+        let result = pt.match_v4(addr);
+        assert_eq!(result, Some(0), "Should match /24 (nexthop 0)");
     }
 }
