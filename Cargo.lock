@@ -352,6 +352,15 @@ name = "poptrie"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "poptrie-test-util",
+ "proptest",
+]
+
+[[package]]
+name = "poptrie-test-util"
+version = "0.1.0"
+dependencies = [
+ "poptrie",
  "proptest",
 ]
 
