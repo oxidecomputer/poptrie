@@ -1,6 +1,7 @@
 use poptrie::{Ipv4RoutingTable, Ipv6RoutingTable, Poptrie};
 use proptest::prelude::*;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Instant;
 
 /// Apply a prefix mask to an IPv4 address
 fn mask_v4(addr: [u8; 4], prefix_len: u8) -> [u8; 4] {
@@ -94,9 +95,9 @@ fn ipv6_route_strategy() -> impl Strategy<Value = ([u8; 16], u8, u128)> {
         .prop_map(|(addr, len, nexthop)| (mask_v6(addr, len), len, nexthop))
 }
 
-/// Strategy for generating a routing table with 1-50 routes
+/// Strategy for generating an ipv4 routing table
 fn ipv4_table_strategy() -> impl Strategy<Value = Ipv4RoutingTable<u32>> {
-    prop::collection::vec(ipv4_route_strategy(), 1..50).prop_map(|routes| {
+    prop::collection::vec(ipv4_route_strategy(), 1..8192).prop_map(|routes| {
         let mut table = Ipv4RoutingTable::default();
         for (addr, len, nexthop) in routes {
             table.add(addr, len, nexthop);
@@ -105,9 +106,9 @@ fn ipv4_table_strategy() -> impl Strategy<Value = Ipv4RoutingTable<u32>> {
     })
 }
 
-/// Strategy for generating a routing table with 1-50 routes
+/// Strategy for generating an ipv6 routing table
 fn ipv6_table_strategy() -> impl Strategy<Value = Ipv6RoutingTable<u128>> {
-    prop::collection::vec(ipv6_route_strategy(), 1..50).prop_map(|routes| {
+    prop::collection::vec(ipv6_route_strategy(), 1..8192).prop_map(|routes| {
         let mut table = Ipv6RoutingTable::default();
         for (addr, len, nexthop) in routes {
             table.add(addr, len, nexthop);
@@ -124,11 +125,23 @@ proptest! {
         table in ipv4_table_strategy(),
         lookup_addr in any::<[u8; 4]>()
     ) {
+        let routes = table.len();
+
+        let t0 = Instant::now();
         let pt = Poptrie::from(table.clone());
+        let construct_time = t0.elapsed();
+
         let addr_u32 = u32::from_be_bytes(lookup_addr);
 
+        let t1 = Instant::now();
         let poptrie_result = pt.match_v4(addr_u32);
+        let poptrie_time = t1.elapsed();
+
+        let t2 = Instant::now();
         let naive_result = longest_match_v4(&table, lookup_addr);
+        let naive_time = t2.elapsed();
+
+        eprintln!("routes={routes:5} construct={construct_time:>10?} poptrie={poptrie_time:>10?} naive={naive_time:>10?}");
 
         prop_assert_eq!(poptrie_result, naive_result,
             "Mismatch for addr {:?}", Ipv4Addr::from(lookup_addr));

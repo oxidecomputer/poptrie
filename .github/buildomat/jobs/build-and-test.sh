@@ -21,4 +21,5 @@ cargo fmt -- --check
 cargo clippy -- --deny warnings
 
 banner test
-cargo test
+cargo install cargo-nextest
+cargo nextest run --release
