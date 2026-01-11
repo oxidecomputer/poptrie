@@ -8,4 +8,9 @@ edition = "2021"
 [dependencies]
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
+
+[[bench]]
+name = "lookup"
+harness = false
