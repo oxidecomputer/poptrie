@@ -357,7 +357,7 @@ pub struct Leaf<T> {
     pub data: T,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Ipv4RoutingTable<T>(pub BTreeMap<([u8; 4], u8), T>);
 
 // NOTE #[derive(Default)] see:
@@ -396,7 +396,7 @@ impl<T: Clone> From<Ipv4RoutingTable<T>> for Poptrie<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Ipv6RoutingTable<T>(pub BTreeMap<([u8; 16], u8), T>);
 
 // NOTE #[derive(Default)] see:

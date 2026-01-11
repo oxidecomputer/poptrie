@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5f79a96f3c72f2c335513575ed6e275b205e285a1d487c3a552702337ffdabe5 # shrinks to table = Ipv4RoutingTable({([211, 240, 0, 0], 12): 0})
+cc e23633fadda1d66d843d5ea838ed32b91a876691b23c2c58c83969e9a5c092b8 # shrinks to prefix_16 = [0, 0], third_bytes = {0}, fourth_bytes = [2]
+cc 01e853a36b17d7a86364d8df0c3d4eb0f5eea140cee0e110bdef5b7900fa9af9 # shrinks to base_addr = [0, 0, 0], last_bytes = [0, 0], prefix_lens = [25, 26]
