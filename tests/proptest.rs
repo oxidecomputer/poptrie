@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// Copyright 2026 Oxide Computer Company
+
 use poptrie::{Ipv4RoutingTable, Poptrie};
 use poptrie_test_util::{
     longest_match_v4, longest_match_v6, mask_v4,
@@ -5,7 +11,6 @@ use poptrie_test_util::{
 };
 use proptest::prelude::*;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::time::Instant;
 
 proptest! {
     /// Test that looking up any address returns the same result as a naive
@@ -15,23 +20,10 @@ proptest! {
         table in ipv4_table_strategy(),
         lookup_addr in any::<[u8; 4]>()
     ) {
-        let routes = table.len();
-
-        let t0 = Instant::now();
         let pt = Poptrie::from(table.clone());
-        let construct_time = t0.elapsed();
-
         let addr_u32 = u32::from_be_bytes(lookup_addr);
-
-        let t1 = Instant::now();
         let poptrie_result = pt.match_v4(addr_u32);
-        let poptrie_time = t1.elapsed();
-
-        let t2 = Instant::now();
         let naive_result = longest_match_v4(&table, lookup_addr);
-        let naive_time = t2.elapsed();
-
-        eprintln!("routes={routes:5} construct={construct_time:>10?} poptrie={poptrie_time:>10?} naive={naive_time:>10?}");
 
         prop_assert_eq!(poptrie_result, naive_result,
             "Mismatch for addr {:?}", Ipv4Addr::from(lookup_addr));
@@ -208,12 +200,12 @@ fn regression_31_32_pattern() {
     // This pattern mimics the original failing test
     let mut table = Ipv4RoutingTable::default();
 
-    // Multiple /31 routes with same first two bytes but different third byte
+    // Multiple /31 routes with same first three bytes but different fourth byte
     table.add([169, 254, 0, 0], 31, 1);
     table.add([169, 254, 0, 2], 31, 2);
     table.add([169, 254, 0, 6], 31, 3);
 
-    // Multiple /32 routes with different third byte
+    // Multiple /32 routes with different fourth byte
     table.add([169, 254, 254, 1], 32, 7);
     table.add([169, 254, 254, 2], 32, 8);
     table.add([169, 254, 254, 4], 32, 9);

@@ -1,10 +1,12 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// Copyright 2026 Oxide Computer Company
+
 //! Test utilities for poptrie.
 //!
-//! This crate provides common testing utilities including:
-//! - Prefix masking functions for IPv4 and IPv6
-//! - Naive longest-prefix-match implementations for verification
-//! - Table and address generation utilities for benchmarks
-//! - Proptest strategies (behind the `proptest` feature)
+//! This crate provides common testing utilities
 
 use poptrie::{Ipv4RoutingTable, Ipv6RoutingTable};
 

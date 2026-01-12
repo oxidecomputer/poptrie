@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Copyright 2025 Oxide Computer Company
+// Copyright 2026 Oxide Computer Company
 
 #![no_std]
 
@@ -454,15 +454,15 @@ macro_rules! construct {
                 let mut routes: Vec<_> = $tree.0.iter().collect();
                 routes.sort_by(|a, b| b.0.1.cmp(&a.0.1));
 
-                for (r, e) in routes {
+                for ((addr, prefix_len), data) in routes {
                     // default route case
-                    if r.1 == 0 {
-                        $self.default = Some(Leaf { data: e.clone() });
+                    if *prefix_len == 0 {
+                        $self.default = Some(Leaf { data: data.clone() });
                         continue;
                     }
-                    let k = extract!(6, depth, $w::from_be_bytes(r.0), $bits);
+                    let k = extract!(6, depth, $w::from_be_bytes(*addr), $bits);
                     let consumed = core::cmp::min((depth + 1) * 6, $bits);
-                    if r.1 <= consumed {
+                    if *prefix_len <= consumed {
                         // Only add leaf if no existing leaf at this position.
                         // More specific prefixes (processed first) take precedence.
                         // Note: We allow setting lv even when iv is set - this provides
@@ -470,21 +470,21 @@ macro_rules! construct {
                         // doesn't find a more specific match (the "stash" logic).
                         if ((1u64 << k) & lv) == 0 {
                             lv |= 1u64 << k;
-                            pending_leaves.push((k, e.clone()));
+                            pending_leaves.push((k, data.clone()));
                         }
 
                         // If the prefix of the router entry is less than but not equal
                         // to the consumed number of bits, we need to add those bits to
                         // the bitvec.
-                        if r.1 != consumed {
+                        if *prefix_len != consumed {
                             // Shift by the extra bits and add to the bitvec for this
                             // internal node.
-                            let extra = 1u64 << (consumed - r.1);
+                            let extra = 1u64 << (consumed - *prefix_len);
                             for i in 1..(extra) {
                                 // Only add if slot not already claimed by more specific prefix
                                 if ((1u64 << (k + i as u8)) & lv) == 0 {
                                     lv |= 1u64 << (k + i as u8);
-                                    pending_leaves.push((k + i as u8, e.clone()));
+                                    pending_leaves.push((k + i as u8, data.clone()));
                                 }
                             }
                         }
@@ -493,11 +493,11 @@ macro_rules! construct {
                     iv |= 1u64 << k;
                     match subsubforest.iter_mut().find(|x| x.0 == k) {
                         Some(ref mut entry) => {
-                            entry.1.insert(*r, e.clone());
+                            entry.1.insert((*addr, *prefix_len), data.clone());
                         }
                         None => {
                             let mut tbl = $rt::<$t>::default();
-                            tbl.insert(*r, e.clone());
+                            tbl.insert((*addr, *prefix_len), data.clone());
                             subsubforest.push((k, tbl));
                         }
                     }
