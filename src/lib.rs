@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Copyright 2023 Oxide Computer Company
+// Copyright 2026 Oxide Computer Company
 
 #![no_std]
 
@@ -279,9 +279,20 @@
 //!
 
 extern crate alloc;
+
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use util::mask_through;
+
+mod util;
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+#[macro_use]
+extern crate std;
 
 /// The poptrie data structure.
 #[derive(Debug)]
@@ -294,18 +305,6 @@ pub struct Poptrie<T> {
 
     /// A default route if any.
     pub default: Option<Leaf<T>>,
-}
-
-// NOTE #[derive(Default)] see:
-//     broken https://github.com/rust-lang/rust/issues/26925
-impl<T> Default for Poptrie<T> {
-    fn default() -> Self {
-        Self {
-            interior: Vec::new(),
-            leaf: Vec::new(),
-            default: None,
-        }
-    }
 }
 
 /// An interior poptrie node.
@@ -325,31 +324,6 @@ pub struct Interior {
     pub leaf_offset: u64,
 }
 
-impl core::fmt::Debug for Interior {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let mut islots = Vec::new();
-        let mut lslots = Vec::new();
-        for i in 0..63 {
-            if (self.iv & (1 << i)) != 0 {
-                islots.push(i);
-            }
-        }
-        for i in 0..63 {
-            if (self.lv & (1 << i)) != 0 {
-                lslots.push(i);
-            }
-        }
-        //NOTE casts here due to
-        //  - https://github.com/rust-lang/rust-analyzer/issues/11847
-        f.debug_struct("Interior")
-            .field("iv", &islots as &dyn core::fmt::Debug)
-            .field("lv", &lslots as &dyn core::fmt::Debug)
-            .field("interior_offset", &self.interior_offset)
-            .field("leaf_offset", &self.leaf_offset)
-            .finish()
-    }
-}
-
 /// A leaf poptrie node.
 #[derive(Debug)]
 pub struct Leaf<T> {
@@ -357,30 +331,8 @@ pub struct Leaf<T> {
     pub data: T,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Ipv4RoutingTable<T>(pub BTreeMap<([u8; 4], u8), T>);
-
-// NOTE #[derive(Default)] see:
-//     broken https://github.com/rust-lang/rust/issues/26925
-impl<T> Default for Ipv4RoutingTable<T> {
-    fn default() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<T> core::ops::Deref for Ipv4RoutingTable<T> {
-    type Target = BTreeMap<([u8; 4], u8), T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> core::ops::DerefMut for Ipv4RoutingTable<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
 
 impl<T> Ipv4RoutingTable<T> {
     pub fn add(&mut self, dst: [u8; 4], len: u8, nexthop: T) {
@@ -396,30 +348,8 @@ impl<T: Clone> From<Ipv4RoutingTable<T>> for Poptrie<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Ipv6RoutingTable<T>(pub BTreeMap<([u8; 16], u8), T>);
-
-// NOTE #[derive(Default)] see:
-//     broken https://github.com/rust-lang/rust/issues/26925
-impl<T> Default for Ipv6RoutingTable<T> {
-    fn default() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<T> core::ops::Deref for Ipv6RoutingTable<T> {
-    type Target = BTreeMap<([u8; 16], u8), T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> core::ops::DerefMut for Ipv6RoutingTable<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
 
 impl<T> Ipv6RoutingTable<T> {
     pub fn add(&mut self, dst: [u8; 16], len: u8, nexthop: T) {
@@ -433,23 +363,6 @@ impl<T: Clone> From<Ipv6RoutingTable<T>> for Poptrie<T> {
         s.construct6(tree);
         s
     }
-}
-
-macro_rules! extract {
-    ($width:expr, $offset:expr, $v:expr, $bits:expr) => {{
-        let shift = $bits.saturating_sub($width * ($offset + 1));
-        let mask = 0b111111 << shift;
-        let res = ($v & mask) >> shift;
-        res as u8
-    }};
-}
-
-pub fn extract_32(width: u8, offset: u8, v: u32) -> u8 {
-    extract!(width, offset, v, 32u8)
-}
-
-pub fn extract_128(width: u8, offset: u8, v: u32) -> u8 {
-    extract!(width, offset, v, 128u8)
 }
 
 //TODO having this as a macro is terrible for debugging as we get no backtrace
@@ -468,9 +381,24 @@ macro_rules! matcher {
         #[cfg(test)]
         println!("{:#?}", $self.interior.get(i as usize)?);
 
-        while (v & (1 << n)) != 0 {
+        while (v & (1u64 << n)) != 0 {
+            // Check for stash at CURRENT node BEFORE descending.
+            // This handles the case where both an interior child AND a leaf
+            // exist at the same position (shorter prefix provides fallback).
+            {
+                let lv = $self.interior.get(i as usize)?.lv;
+                if (lv & (1u64 << n)) != 0 {
+                    let base = $self.interior.get(i as usize)?.leaf_offset;
+                    let arg = lv & mask_through(n);
+                    let bc = arg.count_ones() as u64;
+                    let leaf_i = base - lv.count_ones() as u64 + bc - 1;
+                    result = Some($self.leaf.get(leaf_i as usize)?.data.clone())
+                }
+            }
+
+            // Now descend to the interior child
             let base = $self.interior.get(i as usize)?.interior_offset;
-            let arg = v & ((2 << n) - 1);
+            let arg = v & mask_through(n);
             let bc = arg.count_ones() as u64;
             i = base + bc - 1;
             v = $self.interior.get(i as usize)?.iv;
@@ -483,21 +411,15 @@ macro_rules! matcher {
 
             #[cfg(test)]
             println!("{:#?}", $self.interior.get(i as usize)?);
-
-            // check for stash any potentially suboptimal matches, longer
-            // prefix matches will overwrite these
-            let base = $self.interior.get(i as usize)?.leaf_offset;
-            let v = $self.interior.get(i as usize)?.lv;
-            if (v & (1 << n)) != 0 {
-                let i = base - 1;
-                result = Some($self.leaf.get(i as usize)?.data.clone())
-            }
         }
 
+        // Final leaf lookup at the terminal node
         let base = $self.interior.get(i as usize)?.leaf_offset;
         let v = $self.interior.get(i as usize)?.lv;
-        if (v & (1 << n)) != 0 {
-            i = base - 1;
+        if (v & (1u64 << n)) != 0 {
+            let arg = v & mask_through(n);
+            let bc = arg.count_ones() as u64;
+            i = base - v.count_ones() as u64 + bc - 1;
             result = Some($self.leaf.get(i as usize)?.data.clone())
         }
 
@@ -513,55 +435,80 @@ macro_rules! construct {
         let mut ioff = 1;
         for depth in 0..$depth {
             let mut subforest = Vec::<(u8, $rt<$t>)>::new();
-            let mut children = 0;
-            let mut siblings = 0;
+            // Tracks cumulative count of children from preceding sibling trees.
+            // This is used to compute interior_offset for each tree's children.
+            let mut child_offset = 0;
             for (_, $tree) in &forest {
                 let mut iv = 0u64;
                 let mut lv = 0u64;
 
                 let mut subsubforest = Vec::<(u8, $rt<$t>)>::new();
-                for (r, e) in &$tree.0 {
+                // Collect leaves with their bit positions for later sorting.
+                // Leaves must be pushed in bit-position order for the matcher's
+                // popcount-based indexing to work correctly.
+                let mut pending_leaves: Vec<(u8, $t)> = Vec::new();
+
+                // Sort routes by descending prefix length (more specific first).
+                // This ensures longer prefixes claim their slots before shorter
+                // prefixes, implementing proper longest-prefix-match semantics.
+                let mut routes: Vec<_> = $tree.0.iter().collect();
+                routes.sort_by(|a, b| b.0.1.cmp(&a.0.1));
+
+                for ((addr, prefix_len), data) in routes {
                     // default route case
-                    if r.1 == 0 {
-                        $self.default = Some(Leaf { data: e.clone() });
+                    if *prefix_len == 0 {
+                        $self.default = Some(Leaf { data: data.clone() });
                         continue;
                     }
-                    let k = extract!(6, depth, $w::from_be_bytes(r.0), $bits);
+                    let k = extract!(6, depth, $w::from_be_bytes(*addr), $bits);
                     let consumed = core::cmp::min((depth + 1) * 6, $bits);
-                    if r.1 <= consumed {
-                        if ((1 << k) & iv) == 0 {
-                            lv |= 1 << k;
-                            $self.leaf.push(Leaf { data: e.clone() });
+                    if *prefix_len <= consumed {
+                        // Only add leaf if no existing leaf at this position.
+                        // More specific prefixes (processed first) take precedence.
+                        // Note: We allow setting lv even when iv is set - this provides
+                        // fallback matches when traversing through interior nodes
+                        // doesn't find a more specific match (the "stash" logic).
+                        if ((1u64 << k) & lv) == 0 {
+                            lv |= 1u64 << k;
+                            pending_leaves.push((k, data.clone()));
                         }
 
                         // If the prefix of the router entry is less than but not equal
                         // to the consumed number of bits, we need to add those bits to
                         // the bitvec.
-                        if r.1 != consumed {
+                        if *prefix_len != consumed {
                             // Shift by the extra bits and add to the bitvec for this
                             // internal node.
-                            let extra = 1 << (consumed - r.1);
+                            let extra = 1u64 << (consumed - *prefix_len);
                             for i in 1..(extra) {
-                                lv |= 1 << (k + i);
-                                $self.leaf.push(Leaf { data: e.clone() });
+                                // Only add if slot not already claimed by more specific prefix
+                                if ((1u64 << (k + i as u8)) & lv) == 0 {
+                                    lv |= 1u64 << (k + i as u8);
+                                    pending_leaves.push((k + i as u8, data.clone()));
+                                }
                             }
                         }
                         continue;
                     }
-                    iv |= 1 << k;
+                    iv |= 1u64 << k;
                     match subsubforest.iter_mut().find(|x| x.0 == k) {
                         Some(ref mut entry) => {
-                            entry.1.insert(*r, e.clone());
+                            entry.1.insert((*addr, *prefix_len), data.clone());
                         }
                         None => {
                             let mut tbl = $rt::<$t>::default();
-                            tbl.insert(*r, e.clone());
+                            tbl.insert((*addr, *prefix_len), data.clone());
                             subsubforest.push((k, tbl));
-                            if iv > 0 {
-                                children += 1;
-                            }
                         }
                     }
+                }
+
+                // Sort leaves by bit position and push them in order.
+                // The matcher uses popcount to index into leaves, which requires
+                // leaves to be stored in bit-position order.
+                pending_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, data) in pending_leaves {
+                    $self.leaf.push(Leaf { data });
                 }
 
                 if iv > 0 || lv > 0 {
@@ -569,19 +516,23 @@ macro_rules! construct {
                         iv,
                         lv,
                         interior_offset: if iv > 0 {
-                            ioff + siblings
+                            ioff + child_offset
                         } else {
                             0
                         },
                         leaf_offset: $self.leaf.len() as u64,
                     });
-                    if iv > 0 {
-                        siblings += 1;
-                    }
                 }
+                // Sort children by k value to maintain correct popcount-based indexing.
+                // The matcher uses popcount to find the child index, which assumes
+                // children are stored in order of their bit positions in iv.
+                subsubforest.sort_by(|a, b| a.0.cmp(&b.0));
+
+                // Add this tree's children count to the offset for subsequent trees
+                child_offset += subsubforest.len() as u64;
                 subforest.extend_from_slice(&subsubforest);
             }
-            ioff += children;
+            ioff += subforest.len() as u64;
             forest = subforest;
         }
     }}
@@ -612,435 +563,5 @@ impl<T: Clone> Poptrie<T> {
 
     pub fn do_match_v6(&self, addr: u128) -> Option<T> {
         matcher!(self, addr, 128u8)
-    }
-}
-
-#[cfg(test)]
-#[macro_use]
-extern crate std;
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[derive(Default, Copy, Clone, PartialEq)]
-    struct Ipv4(u32);
-    impl core::fmt::Debug for Ipv4 {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            let b = self.0.to_be_bytes();
-            write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-        }
-    }
-
-    impl Ipv4 {
-        fn new(v: [u8; 4]) -> Self {
-            Self(u32::from_be_bytes(v))
-        }
-    }
-
-    #[derive(Default, Copy, Clone, PartialEq)]
-    struct Ipv6(u128);
-    impl core::fmt::Debug for Ipv6 {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            let b = self.0.to_be_bytes();
-            write!(
-                f,
-                "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-                b[0], b[1], b[2], b[3],
-                b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11],
-                b[12], b[13], b[14], b[15],
-            )
-        }
-    }
-
-    impl Ipv6 {
-        fn new(v: [u8; 16]) -> Self {
-            Self(u128::from_be_bytes(v))
-        }
-    }
-
-    impl std::str::FromStr for Ipv6 {
-        type Err = std::net::AddrParseError;
-        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-            let addr: std::net::Ipv6Addr = s.parse()?;
-            Ok(Self::new(addr.octets()))
-        }
-    }
-
-    #[test]
-    fn test_extract32() {
-        // Verify documentation examples
-
-        // 1.0.0.0
-        let v = u32::from_be_bytes([1, 0, 0, 0]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [0, 16, 0, 0, 0, 0]);
-
-        // 247.33.0.0
-        let v = u32::from_be_bytes([247, 33, 0, 0]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [61, 50, 4, 0, 0, 0]);
-
-        // 247.33.12.0
-        let v = u32::from_be_bytes([247, 33, 12, 0]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [61, 50, 4, 12, 0, 0]);
-
-        // 51.12.109.0
-        let v = u32::from_be_bytes([51, 12, 109, 0]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [12, 48, 49, 45, 0, 0]);
-
-        // 77.18.0.0
-        let v = u32::from_be_bytes([77, 18, 0, 0]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [19, 17, 8, 0, 0, 0]);
-
-        // 170.1.14.3
-        let v = u32::from_be_bytes([170, 1, 14, 3]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [42, 32, 4, 14, 0, 3]);
-
-        // 0.0.0.0
-        let v = u32::from_be_bytes([0, 0, 0, 0]);
-        let x = extract_32_all(v);
-        assert_eq!(x, [0, 0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn test_construct_rec() {
-        let tbl = test_routing_table_with_default_route_v4();
-        let pt = Poptrie::<Ipv4>::from(tbl);
-
-        #[allow(clippy::identity_op)]
-        let expected_root_bitvec =
-            0u64 | 1 << 0 | 1 << 61 | 1 << 61 | 1 << 12 | 1 << 19 | 1 << 42;
-
-        assert_eq!(expected_root_bitvec, pt.interior[0].iv);
-        assert_eq!(pt.leaf.len(), 27);
-
-        println!("{:#?}", pt);
-    }
-
-    #[test]
-    fn test_match_v4() {
-        let tbl = test_routing_table_v4();
-        let pt = Poptrie::<Ipv4>::from(tbl);
-
-        // Test hits
-        let addr = Ipv4::new([1, 7, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([1, 254, 254, 254])));
-
-        let addr = Ipv4::new([247, 33, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([247, 33, 0, 1])));
-
-        let addr = Ipv4::new([247, 33, 12, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([247, 33, 12, 1])));
-
-        let addr = Ipv4::new([51, 12, 109, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([51, 12, 109, 10])));
-
-        let addr = Ipv4::new([77, 18, 4, 7]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([77, 18, 10, 1])));
-
-        let addr = Ipv4::new([170, 1, 14, 3]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([1, 7, 0, 1])));
-
-        // Test default route
-        let addr = Ipv4::new([4, 7, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, None);
-
-        let tbl = test_routing_table_with_default_route_v4();
-        let pt = Poptrie::<Ipv4>::from(tbl);
-
-        // Test default route
-        let addr = Ipv4::new([4, 7, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, Some(Ipv4::new([1, 2, 3, 4])));
-    }
-
-    #[test]
-    fn test_match_v4_multi() {
-        let tbl = test_routing_table_v4_mp();
-        let pt = Poptrie::<Vec<Ipv4>>::from(tbl);
-
-        // Test hits
-        let addr = Ipv4::new([1, 7, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([1, 254, 254, 254]), // path 1
-                Ipv4::new([1, 254, 254, 255]), // path 2
-            ])
-        );
-
-        let addr = Ipv4::new([247, 33, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([247, 33, 0, 1]), // path 1
-                Ipv4::new([247, 33, 0, 2]), // path 2
-            ])
-        );
-
-        let addr = Ipv4::new([247, 33, 12, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([247, 33, 12, 1]), // path 1
-                Ipv4::new([247, 33, 12, 2]), // path 2
-            ])
-        );
-
-        let addr = Ipv4::new([51, 12, 109, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([51, 12, 109, 10]), // path 1
-                Ipv4::new([51, 12, 109, 11]), // path 2
-            ],)
-        );
-
-        let addr = Ipv4::new([77, 18, 4, 7]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([77, 18, 10, 1]), // path 1
-                Ipv4::new([77, 18, 10, 2]), // path 2
-            ],)
-        );
-
-        let addr = Ipv4::new([170, 1, 14, 3]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([1, 7, 0, 1]), // path 1
-                Ipv4::new([1, 7, 0, 2]), // path 2
-            ],)
-        );
-
-        // Test default route
-        let addr = Ipv4::new([4, 7, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(m, None);
-
-        let tbl = test_routing_table_with_default_route_v4_mp();
-        let pt = Poptrie::<Vec<Ipv4>>::from(tbl);
-
-        // Test default route
-        let addr = Ipv4::new([4, 7, 0, 1]);
-        let m = pt.match_v4(addr.0);
-        assert_eq!(
-            m,
-            Some(vec![
-                Ipv4::new([1, 2, 3, 4]), // path 1
-                Ipv4::new([1, 2, 3, 5]), // path 2
-            ])
-        );
-    }
-
-    #[test]
-    fn test_match_v6() {
-        let tbl = test_routing_table_v6();
-        let pt = Poptrie::<Ipv6>::from(tbl);
-
-        // Test hits
-        let addr: Ipv6 = "1:7:0::1".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "1::ffff:ffff:ffff".parse().unwrap();
-        assert_eq!(m, Some(gw));
-
-        let addr: Ipv6 = "247:33::1".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "247:33::1".parse().unwrap();
-        assert_eq!(m, Some(gw));
-
-        let addr: Ipv6 = "247:33:12::1".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "247:33:12::1".parse().unwrap();
-        assert_eq!(m, Some(gw));
-
-        let addr: Ipv6 = "51:12:109::1".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "51:12:109::10".parse().unwrap();
-        assert_eq!(m, Some(gw));
-
-        let addr: Ipv6 = "77:18:4::7".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "77:18:10::1".parse().unwrap();
-        assert_eq!(m, Some(gw));
-
-        let addr: Ipv6 = "170:1:14::3".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "1:7:0::1".parse().unwrap();
-        assert_eq!(m, Some(gw));
-
-        // Test default route
-        let addr: Ipv6 = "4:7:0::1".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        assert_eq!(m, None);
-
-        let tbl = test_routing_table_with_default_route_v6();
-        let pt = Poptrie::<Ipv6>::from(tbl);
-
-        let addr: Ipv6 = "4:7:0::1".parse().unwrap();
-        let m = pt.match_v6(addr.0);
-        let gw: Ipv6 = "1:2:3::4".parse().unwrap();
-        assert_eq!(m, Some(gw));
-    }
-
-    fn test_routing_table_v4() -> Ipv4RoutingTable<Ipv4> {
-        let mut tbl = Ipv4RoutingTable::<Ipv4>::default();
-        tbl.add([1, 0, 0, 0], 8, Ipv4::new([1, 254, 254, 254]));
-        tbl.add([247, 33, 0, 0], 16, Ipv4::new([247, 33, 0, 1]));
-        tbl.add([247, 33, 12, 0], 24, Ipv4::new([247, 33, 12, 1]));
-        tbl.add([51, 12, 109, 0], 24, Ipv4::new([51, 12, 109, 10]));
-        tbl.add([77, 18, 0, 0], 16, Ipv4::new([77, 18, 10, 1]));
-        tbl.add([170, 1, 14, 3], 32, Ipv4::new([1, 7, 0, 1]));
-        tbl
-    }
-
-    fn test_routing_table_v4_mp() -> Ipv4RoutingTable<Vec<Ipv4>> {
-        let mut tbl = Ipv4RoutingTable::<Vec<Ipv4>>::default();
-        tbl.add(
-            [1, 0, 0, 0],
-            8,
-            vec![
-                Ipv4::new([1, 254, 254, 254]), // path 1
-                Ipv4::new([1, 254, 254, 255]), // path 2
-            ],
-        );
-
-        tbl.add(
-            [247, 33, 0, 0],
-            16,
-            vec![
-                Ipv4::new([247, 33, 0, 1]), // path 1
-                Ipv4::new([247, 33, 0, 2]), // path 2
-            ],
-        );
-
-        tbl.add(
-            [247, 33, 12, 0],
-            24,
-            vec![
-                Ipv4::new([247, 33, 12, 1]), // path 1
-                Ipv4::new([247, 33, 12, 2]), // path 2
-            ],
-        );
-
-        tbl.add(
-            [51, 12, 109, 0],
-            24,
-            vec![
-                Ipv4::new([51, 12, 109, 10]), // path 1
-                Ipv4::new([51, 12, 109, 11]), // path 2
-            ],
-        );
-
-        tbl.add(
-            [77, 18, 0, 0],
-            16,
-            vec![
-                Ipv4::new([77, 18, 10, 1]), // path 1
-                Ipv4::new([77, 18, 10, 2]), // path 2
-            ],
-        );
-
-        tbl.add(
-            [170, 1, 14, 3],
-            32,
-            vec![
-                Ipv4::new([1, 7, 0, 1]), // path 1
-                Ipv4::new([1, 7, 0, 2]), // path 2
-            ],
-        );
-
-        tbl
-    }
-
-    fn test_routing_table_with_default_route_v4() -> Ipv4RoutingTable<Ipv4> {
-        let mut tbl = test_routing_table_v4();
-        tbl.add([0, 0, 0, 0], 0, Ipv4::new([1, 2, 3, 4]));
-        tbl
-    }
-
-    fn test_routing_table_with_default_route_v4_mp(
-    ) -> Ipv4RoutingTable<Vec<Ipv4>> {
-        let mut tbl = test_routing_table_v4_mp();
-        tbl.add(
-            [0, 0, 0, 0],
-            0,
-            vec![
-                Ipv4::new([1, 2, 3, 4]), // path 1
-                Ipv4::new([1, 2, 3, 5]), // path 2
-            ],
-        );
-        tbl
-    }
-
-    fn test_routing_table_v6() -> Ipv6RoutingTable<Ipv6> {
-        let mut tbl = Ipv6RoutingTable::<Ipv6>::default();
-
-        let rt: std::net::Ipv6Addr = "1::".parse().unwrap();
-        let gw: Ipv6 = "1::ffff:ffff:ffff".parse().unwrap();
-        tbl.add(rt.octets(), 16, gw);
-
-        let rt: std::net::Ipv6Addr = "247:33::".parse().unwrap();
-        let gw: Ipv6 = "247:33::1".parse().unwrap();
-        tbl.add(rt.octets(), 32, gw);
-
-        let rt: std::net::Ipv6Addr = "247:33:12::".parse().unwrap();
-        let gw: Ipv6 = "247:33:12::1".parse().unwrap();
-        tbl.add(rt.octets(), 48, gw);
-
-        let rt: std::net::Ipv6Addr = "51:12:109::".parse().unwrap();
-        let gw: Ipv6 = "51:12:109::10".parse().unwrap();
-        tbl.add(rt.octets(), 48, gw);
-
-        let rt: std::net::Ipv6Addr = "77:18::".parse().unwrap();
-        let gw: Ipv6 = "77:18:10::1".parse().unwrap();
-        tbl.add(rt.octets(), 32, gw);
-
-        let rt: std::net::Ipv6Addr = "170:1:14::3".parse().unwrap();
-        let gw: Ipv6 = "1:7:0::1".parse().unwrap();
-        tbl.add(rt.octets(), 128, gw);
-
-        tbl
-    }
-
-    fn test_routing_table_with_default_route_v6() -> Ipv6RoutingTable<Ipv6> {
-        let mut tbl = test_routing_table_v6();
-
-        let rt: std::net::Ipv6Addr = "::".parse().unwrap();
-        let gw: Ipv6 = "1:2:3::4".parse().unwrap();
-        tbl.add(rt.octets(), 0, gw);
-
-        tbl
-    }
-
-    fn extract_32_all(v: u32) -> [u8; 6] {
-        [
-            extract_32(6, 0, v),
-            extract_32(6, 1, v),
-            extract_32(6, 2, v),
-            extract_32(6, 3, v),
-            extract_32(6, 4, v),
-            extract_32(6, 5, v),
-        ]
     }
 }

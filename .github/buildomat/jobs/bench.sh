@@ -1,6 +1,6 @@
 #!/bin/bash
 #:
-#: name = "build-and-test"
+#: name = "bench"
 #: variety = "basic"
 #: target = "helios-2.0"
 #: rust_toolchain = "stable"
@@ -14,12 +14,5 @@ set -o xtrace
 cargo --version
 rustc --version
 
-banner build
-cargo build
-
-cargo fmt -- --check
-cargo clippy -- --deny warnings
-
-banner test
-cargo install cargo-nextest
-cargo nextest run --release
+banner bench
+cargo bench

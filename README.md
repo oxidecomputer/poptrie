@@ -13,4 +13,19 @@ Poptrie was created by Asai and Ohara in:
 This is a dependency free `no_std` implementation to facilitate use in OS
 kernels.
 
-**This is a work in progress implementation.**
+Performance analysis versus a naive LPM table is the following for a single
+lookup. The naive lookup scales linearly and quickly exceeds the realm of
+acceptable performance for data plane networking while the poptrie has near
+constant scaling.
+
+```
+┌────────┬─────────┬────────┬─────────┐
+│ Routes │ Poptrie │ Naive  │ Speedup │
+├────────┼─────────┼────────┼─────────┤
+│ 100    │ 5.9 ns  │ 426 ns │ 72x     │
+├────────┼─────────┼────────┼─────────┤
+│ 1,000  │ 5.9 ns  │ 4.9 µs │ 830x    │
+├────────┼─────────┼────────┼─────────┤
+│ 10,000 │ 10.3 ns │ 32 µs  │ 3,100x  │
+└────────┴─────────┴────────┴─────────┘
+````

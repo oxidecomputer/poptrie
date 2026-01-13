@@ -1,0 +1,15 @@
+[package]
+name = "poptrie-test-util"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+poptrie = { path = ".." }
+
+[dependencies.proptest]
+version = "1"
+optional = true
+
+[features]
+default = []
+proptest = ["dep:proptest"]
