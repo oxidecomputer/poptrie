@@ -496,7 +496,7 @@ fn construct<Ip: IpAddress, T: Clone>(
     poptrie: &mut Poptrie<T>,
     tree: IpRoutingTable<Ip, T>,
 ) {
-    let depth = (Ip::BITS + 5) / 6;
+    let depth = Ip::BITS.div_ceil(6);
     let bits = Ip::BITS;
     let mut forest = vec![(0, tree)];
 
