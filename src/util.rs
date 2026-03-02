@@ -6,20 +6,20 @@
 
 //! Display machinery
 
-use crate::{Interior, Ipv4RoutingTable, Ipv6RoutingTable, Poptrie};
+use crate::{
+    Interior, IpAddress, IpRoutingTable, Ipv4RoutingTable, Ipv6RoutingTable,
+    Poptrie,
+};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::ops::{Deref, DerefMut};
 
-#[macro_export]
-macro_rules! extract {
-    ($width:expr, $offset:expr, $v:expr, $bits:expr) => {{
-        let shift = $bits.saturating_sub($width * ($offset + 1));
-        let mask = 0b111111 << shift;
-        let res = ($v & mask) >> shift;
-        res as u8
-    }};
+pub fn extract<Ip: IpAddress>(width: u8, offset: u8, v: Ip) -> u8 {
+    let shift = Ip::BITS.saturating_sub(width * (offset + 1));
+    let mask: Ip = Ip::from(0b111111) << shift;
+    let res = (v & mask) >> shift;
+    res.to_u8()
 }
 
 impl Debug for Interior {
@@ -70,6 +70,12 @@ impl<T> Default for Ipv4RoutingTable<T> {
 // NOTE #[derive(Default)] is broken see:
 // https://github.com/rust-lang/rust/issues/26925
 impl<T> Default for Ipv6RoutingTable<T> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<Ip: IpAddress, T> Default for IpRoutingTable<Ip, T> {
     fn default() -> Self {
         Self(BTreeMap::new())
     }

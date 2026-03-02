@@ -283,6 +283,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::{BitAnd, Shl, Shr};
 use util::mask_through;
 
 mod util;
@@ -331,6 +332,70 @@ pub struct Leaf<T> {
     pub data: T,
 }
 
+pub trait IpAddress:
+    Sized
+    + BitAnd<Output = Self>
+    + Shr<u8, Output = Self>
+    + Shl<u8, Output = Self>
+    + From<u8>
+    + Copy
+{
+    const BITS: u8;
+    const BYTES: usize = (Self::BITS / 8) as usize;
+    type ByteArray: AsRef<[u8]> + AsMut<[u8]> + Copy + Ord;
+
+    fn from_be_bytes(bytes: &Self::ByteArray) -> Self;
+    fn to_be_bytes(self) -> Self::ByteArray;
+    fn to_u8(self) -> u8;
+}
+
+impl IpAddress for u32 {
+    const BITS: u8 = u32::BITS as u8;
+    type ByteArray = [u8; Self::BYTES];
+
+    fn from_be_bytes(bytes: &Self::ByteArray) -> Self {
+        u32::from_be_bytes(*bytes)
+    }
+
+    fn to_be_bytes(self) -> Self::ByteArray {
+        self.to_be_bytes()
+    }
+
+    #[inline]
+    fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl IpAddress for u128 {
+    const BITS: u8 = u128::BITS as u8;
+    type ByteArray = [u8; Self::BYTES];
+
+    fn from_be_bytes(bytes: &Self::ByteArray) -> Self {
+        u128::from_be_bytes(*bytes)
+    }
+
+    fn to_be_bytes(self) -> Self::ByteArray {
+        self.to_be_bytes()
+    }
+
+    #[inline]
+    fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IpRoutingTable<Ip: IpAddress, T>(
+    pub BTreeMap<(Ip::ByteArray, u8), T>,
+);
+
+impl<Ip: IpAddress, T> IpRoutingTable<Ip, T> {
+    pub fn add(&mut self, dst: Ip::ByteArray, len: u8, nexthop: T) {
+        self.0.insert((dst, len), nexthop);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Ipv4RoutingTable<T>(pub BTreeMap<([u8; 4], u8), T>);
 
@@ -365,186 +430,188 @@ impl<T: Clone> From<Ipv6RoutingTable<T>> for Poptrie<T> {
     }
 }
 
-//TODO having this as a macro is terrible for debugging as we get no backtrace
-macro_rules! matcher {
-    ($self:ident, $addr:tt, $bits:expr) => {{
-        let mut i = 0u64;
-        let mut v = $self.interior.get(i as usize)?.iv;
-        let mut offset = 0;
-        let mut n = extract!(6, offset, $addr, $bits);
+fn matcher<Ip: IpAddress, T: Clone>(
+    poptrie: &Poptrie<T>,
+    addr: Ip,
+) -> Option<T> {
+    let mut i = 0u64;
+    let mut v = poptrie.interior.get(i as usize)?.iv;
+    let mut offset = 0;
+    let mut n = crate::util::extract(6, offset, addr);
 
-        let mut result = None;
+    let mut result = None;
+
+    #[cfg(test)]
+    println!("n={n}");
+
+    #[cfg(test)]
+    println!("{:#?}", poptrie.interior.get(i as usize)?);
+
+    while (v & (1u64 << n)) != 0 {
+        // Check for stash at CURRENT node BEFORE descending.
+        // This handles the case where both an interior child AND a leaf
+        // exist at the same position (shorter prefix provides fallback).
+        {
+            let lv = poptrie.interior.get(i as usize)?.lv;
+            if (lv & (1u64 << n)) != 0 {
+                let base = poptrie.interior.get(i as usize)?.leaf_offset;
+                let arg = lv & mask_through(n);
+                let bc = arg.count_ones() as u64;
+                let leaf_i = base - lv.count_ones() as u64 + bc - 1;
+                result = Some(poptrie.leaf.get(leaf_i as usize)?.data.clone())
+            }
+        }
+
+        // Now descend to the interior child
+        let base = poptrie.interior.get(i as usize)?.interior_offset;
+        let arg = v & mask_through(n);
+        let bc = arg.count_ones() as u64;
+        i = base + bc - 1;
+        v = poptrie.interior.get(i as usize)?.iv;
+
+        offset += 1;
+        n = crate::util::extract(6, offset, addr);
 
         #[cfg(test)]
         println!("n={n}");
 
         #[cfg(test)]
-        println!("{:#?}", $self.interior.get(i as usize)?);
+        println!("{:#?}", poptrie.interior.get(i as usize)?);
+    }
 
-        while (v & (1u64 << n)) != 0 {
-            // Check for stash at CURRENT node BEFORE descending.
-            // This handles the case where both an interior child AND a leaf
-            // exist at the same position (shorter prefix provides fallback).
-            {
-                let lv = $self.interior.get(i as usize)?.lv;
-                if (lv & (1u64 << n)) != 0 {
-                    let base = $self.interior.get(i as usize)?.leaf_offset;
-                    let arg = lv & mask_through(n);
-                    let bc = arg.count_ones() as u64;
-                    let leaf_i = base - lv.count_ones() as u64 + bc - 1;
-                    result = Some($self.leaf.get(leaf_i as usize)?.data.clone())
-                }
-            }
+    // Final leaf lookup at the terminal node
+    let base = poptrie.interior.get(i as usize)?.leaf_offset;
+    let v = poptrie.interior.get(i as usize)?.lv;
+    if (v & (1u64 << n)) != 0 {
+        let arg = v & mask_through(n);
+        let bc = arg.count_ones() as u64;
+        i = base - v.count_ones() as u64 + bc - 1;
+        result = Some(poptrie.leaf.get(i as usize)?.data.clone())
+    }
 
-            // Now descend to the interior child
-            let base = $self.interior.get(i as usize)?.interior_offset;
-            let arg = v & mask_through(n);
-            let bc = arg.count_ones() as u64;
-            i = base + bc - 1;
-            v = $self.interior.get(i as usize)?.iv;
-
-            offset += 1;
-            n = extract!(6, offset, $addr, $bits);
-
-            #[cfg(test)]
-            println!("n={n}");
-
-            #[cfg(test)]
-            println!("{:#?}", $self.interior.get(i as usize)?);
-        }
-
-        // Final leaf lookup at the terminal node
-        let base = $self.interior.get(i as usize)?.leaf_offset;
-        let v = $self.interior.get(i as usize)?.lv;
-        if (v & (1u64 << n)) != 0 {
-            let arg = v & mask_through(n);
-            let bc = arg.count_ones() as u64;
-            i = base - v.count_ones() as u64 + bc - 1;
-            result = Some($self.leaf.get(i as usize)?.data.clone())
-        }
-
-        result
-    }};
+    result
 }
 
-//TODO having this as a macro is terrible for debugging as we get no backtrace
-macro_rules! construct {
-    ($self:ident, $tree:ident, $bits:expr, $depth:expr, $rt:ident<$t:tt>, $w:tt) => {{
-        let mut forest = vec![(0, $tree)];
+fn construct<Ip: IpAddress, T: Clone>(
+    poptrie: &mut Poptrie<T>,
+    tree: IpRoutingTable<Ip, T>,
+) {
+    let depth = Ip::BITS.div_ceil(6);
+    let bits = Ip::BITS;
+    let mut forest = vec![(0, tree)];
 
-        let mut ioff = 1;
-        for depth in 0..$depth {
-            let mut subforest = Vec::<(u8, $rt<$t>)>::new();
-            // Tracks cumulative count of children from preceding sibling trees.
-            // This is used to compute interior_offset for each tree's children.
-            let mut child_offset = 0;
-            for (_, $tree) in &forest {
-                let mut iv = 0u64;
-                let mut lv = 0u64;
+    let mut ioff = 1;
+    for depth in 0..depth {
+        let mut subforest = Vec::<(u8, IpRoutingTable<Ip, T>)>::new();
+        // Tracks cumulative count of children from preceding sibling trees.
+        // This is used to compute interior_offset for each tree's children.
+        let mut child_offset = 0;
+        for (_, tree) in &forest {
+            let mut iv = 0u64;
+            let mut lv = 0u64;
 
-                let mut subsubforest = Vec::<(u8, $rt<$t>)>::new();
-                // Collect leaves with their bit positions for later sorting.
-                // Leaves must be pushed in bit-position order for the matcher's
-                // popcount-based indexing to work correctly.
-                let mut pending_leaves: Vec<(u8, $t)> = Vec::new();
+            let mut subsubforest = Vec::<(u8, IpRoutingTable<Ip, T>)>::new();
+            // Collect leaves with their bit positions for later sorting.
+            // Leaves must be pushed in bit-position order for the matcher's
+            // popcount-based indexing to work correctly.
+            let mut pending_leaves: Vec<(u8, T)> = Vec::new();
+            // Sort routes by descending prefix length (more specific first).
+            // This ensures longer prefixes claim their slots before shorter
+            // prefixes, implementing proper longest-prefix-match semantics.
+            let mut routes: Vec<_> = tree.0.iter().collect();
+            routes.sort_by(|a, b| b.0 .1.cmp(&a.0 .1));
 
-                // Sort routes by descending prefix length (more specific first).
-                // This ensures longer prefixes claim their slots before shorter
-                // prefixes, implementing proper longest-prefix-match semantics.
-                let mut routes: Vec<_> = $tree.0.iter().collect();
-                routes.sort_by(|a, b| b.0.1.cmp(&a.0.1));
-
-                for ((addr, prefix_len), data) in routes {
-                    // default route case
-                    if *prefix_len == 0 {
-                        $self.default = Some(Leaf { data: data.clone() });
-                        continue;
+            for ((addr, prefix_len), data) in routes {
+                // default route case
+                if *prefix_len == 0 {
+                    poptrie.default = Some(Leaf { data: data.clone() });
+                    continue;
+                }
+                let k = crate::util::extract(6, depth, Ip::from_be_bytes(addr));
+                let consumed = core::cmp::min((depth + 1) * 6, bits);
+                if *prefix_len <= consumed {
+                    // Only add leaf if no existing leaf at this position.
+                    // More specific prefixes (processed first) take precedence.
+                    // Note: We allow setting lv even when iv is set - this provides
+                    // fallback matches when traversing through interior nodes
+                    // doesn't find a more specific match (the "stash" logic).
+                    if ((1u64 << k) & lv) == 0 {
+                        lv |= 1u64 << k;
+                        pending_leaves.push((k, data.clone()));
                     }
-                    let k = extract!(6, depth, $w::from_be_bytes(*addr), $bits);
-                    let consumed = core::cmp::min((depth + 1) * 6, $bits);
-                    if *prefix_len <= consumed {
-                        // Only add leaf if no existing leaf at this position.
-                        // More specific prefixes (processed first) take precedence.
-                        // Note: We allow setting lv even when iv is set - this provides
-                        // fallback matches when traversing through interior nodes
-                        // doesn't find a more specific match (the "stash" logic).
-                        if ((1u64 << k) & lv) == 0 {
-                            lv |= 1u64 << k;
-                            pending_leaves.push((k, data.clone()));
-                        }
 
-                        // If the prefix of the router entry is less than but not equal
-                        // to the consumed number of bits, we need to add those bits to
-                        // the bitvec.
-                        if *prefix_len != consumed {
-                            // Shift by the extra bits and add to the bitvec for this
-                            // internal node.
-                            let extra = 1u64 << (consumed - *prefix_len);
-                            for i in 1..(extra) {
-                                // Only add if slot not already claimed by more specific prefix
-                                if ((1u64 << (k + i as u8)) & lv) == 0 {
-                                    lv |= 1u64 << (k + i as u8);
-                                    pending_leaves.push((k + i as u8, data.clone()));
-                                }
+                    // If the prefix of the router entry is less than but not equal
+                    // to the consumed number of bits, we need to add those bits to
+                    // the bitvec.
+                    if *prefix_len != consumed {
+                        // Shift by the extra bits and add to the bitvec for this
+                        // internal node.
+                        let extra = 1u64 << (consumed - *prefix_len);
+                        for i in 1..(extra) {
+                            // Only add if slot not already claimed by more specific prefix
+                            if ((1u64 << (k + i as u8)) & lv) == 0 {
+                                lv |= 1u64 << (k + i as u8);
+                                pending_leaves
+                                    .push((k + i as u8, data.clone()));
                             }
                         }
-                        continue;
                     }
-                    iv |= 1u64 << k;
-                    match subsubforest.iter_mut().find(|x| x.0 == k) {
-                        Some(ref mut entry) => {
-                            entry.1.insert((*addr, *prefix_len), data.clone());
-                        }
-                        None => {
-                            let mut tbl = $rt::<$t>::default();
-                            tbl.insert((*addr, *prefix_len), data.clone());
-                            subsubforest.push((k, tbl));
-                        }
+                    continue;
+                }
+                iv |= 1u64 << k;
+                match subsubforest.iter_mut().find(|x| x.0 == k) {
+                    Some(ref mut entry) => {
+                        entry.1.add(*addr, *prefix_len, data.clone());
+                    }
+                    None => {
+                        let mut tbl = IpRoutingTable::default();
+                        tbl.add(*addr, *prefix_len, data.clone());
+                        subsubforest.push((k, tbl));
                     }
                 }
-
-                // Sort leaves by bit position and push them in order.
-                // The matcher uses popcount to index into leaves, which requires
-                // leaves to be stored in bit-position order.
-                pending_leaves.sort_by(|a, b| a.0.cmp(&b.0));
-                for (_, data) in pending_leaves {
-                    $self.leaf.push(Leaf { data });
-                }
-
-                if iv > 0 || lv > 0 {
-                    $self.interior.push(Interior {
-                        iv,
-                        lv,
-                        interior_offset: if iv > 0 {
-                            ioff + child_offset
-                        } else {
-                            0
-                        },
-                        leaf_offset: $self.leaf.len() as u64,
-                    });
-                }
-                // Sort children by k value to maintain correct popcount-based indexing.
-                // The matcher uses popcount to find the child index, which assumes
-                // children are stored in order of their bit positions in iv.
-                subsubforest.sort_by(|a, b| a.0.cmp(&b.0));
-
-                // Add this tree's children count to the offset for subsequent trees
-                child_offset += subsubforest.len() as u64;
-                subforest.extend_from_slice(&subsubforest);
             }
-            ioff += subforest.len() as u64;
-            forest = subforest;
+
+            // Sort leaves by bit position and push them in order.
+            // The matcher uses popcount to index into leaves, which requires
+            // leaves to be stored in bit-position order.
+            pending_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, data) in pending_leaves {
+                poptrie.leaf.push(Leaf { data });
+            }
+
+            if iv > 0 || lv > 0 {
+                poptrie.interior.push(Interior {
+                    iv,
+                    lv,
+                    interior_offset: if iv > 0 {
+                        ioff + child_offset
+                    } else {
+                        0
+                    },
+                    leaf_offset: poptrie.leaf.len() as u64,
+                });
+            }
+            // Sort children by k value to maintain correct popcount-based indexing.
+            // The matcher uses popcount to find the child index, which assumes
+            // children are stored in order of their bit positions in iv.
+            subsubforest.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // Add this tree's children count to the offset for subsequent trees
+            child_offset += subsubforest.len() as u64;
+            subforest.extend_from_slice(&subsubforest);
         }
-    }}
+        ioff += subforest.len() as u64;
+        forest = subforest;
+    }
 }
 
 impl<T: Clone> Poptrie<T> {
     pub fn construct4(&mut self, tree: Ipv4RoutingTable<T>) {
-        construct!(self, tree, 32u8, 6, Ipv4RoutingTable<T>, u32);
+        construct(self, IpRoutingTable::<u32, T>(tree.0));
     }
 
     pub fn construct6(&mut self, tree: Ipv6RoutingTable<T>) {
-        construct!(self, tree, 128u8, 22, Ipv6RoutingTable<T>, u128);
+        construct(self, IpRoutingTable::<u128, T>(tree.0));
     }
 
     pub fn match_v4(&self, addr: u32) -> Option<T> {
@@ -558,10 +625,10 @@ impl<T: Clone> Poptrie<T> {
     }
 
     pub fn do_match_v4(&self, addr: u32) -> Option<T> {
-        matcher!(self, addr, 32u8)
+        matcher(self, addr)
     }
 
     pub fn do_match_v6(&self, addr: u128) -> Option<T> {
-        matcher!(self, addr, 128u8)
+        matcher(self, addr)
     }
 }

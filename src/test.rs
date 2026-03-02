@@ -4,6 +4,8 @@
 
 // Copyright 2026 Oxide Computer Company
 
+use crate::util::extract;
+
 use super::*;
 
 #[derive(Default, Copy, Clone, PartialEq)]
@@ -52,7 +54,7 @@ impl std::str::FromStr for Ipv6 {
 }
 
 fn extract_32(width: u8, offset: u8, v: u32) -> u8 {
-    extract!(width, offset, v, 32u8)
+    extract(width, offset, v)
 }
 
 #[test]
